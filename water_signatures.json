@@ -1,0 +1,93 @@
+{
+  "5.8_110.0_1.1_0.02": {
+    "sensor_data": {
+      "ph": 5.816226959228516,
+      "TDS": 109.11994171142578,
+      "turbidity": 1.060606002807617,
+      "VOC": 0.023000000044703
+    },
+    "best_method": "ultrasonic_filter,activated_carbon,fine_filter",
+    "improvement_score": 0.23735158029126233,
+    "achieved_threshold": true,
+    "last_updated": "2025-12-05T11:38:44.883681",
+    "usage_count": 0
+  },
+  "6.1_0.0_1.0_0.91": {
+    "sensor_data": {
+      "ph": 6.072824954986572,
+      "TDS": 0.0,
+      "turbidity": 0.972629547119141,
+      "VOC": 0.908999979496002
+    },
+    "best_method": "OFF",
+    "improvement_score": 0.5357141453580079,
+    "achieved_threshold": true,
+    "last_updated": "2025-12-05T11:47:42.457560",
+    "usage_count": 0
+  },
+  "4.3_40.0_1.0_3.12": {
+    "sensor_data": {
+      "ph": 4.310850620269775,
+      "TDS": 42.725364685058594,
+      "turbidity": 1.041055679321289,
+      "VOC": 3.121999979019165
+    },
+    "best_method": "activated_carbon",
+    "improvement_score": 0.1574073981896373,
+    "achieved_threshold": true,
+    "last_updated": "2025-12-05T11:49:30.203042",
+    "usage_count": 0
+  },
+  "6.0_40.0_1.1_0.69": {
+    "sensor_data": {
+      "ph": 6.021505355834961,
+      "TDS": 40.74555969238281,
+      "turbidity": 1.129032254219055,
+      "VOC": 0.689000010490417
+    },
+    "best_method": "ultrasonic_filter",
+    "improvement_score": 0.21678482503098967,
+    "achieved_threshold": true,
+    "last_updated": "2025-12-05T12:15:55.546495",
+    "usage_count": 0
+  },
+  "1.1_10.0_1.0_1.99": {
+    "sensor_data": {
+      "ph": 1.060606002807617,
+      "TDS": 6.258556365966797,
+      "turbidity": 1.036168098449707,
+      "VOC": 1.991000056266785
+    },
+    "best_method": "ultrasonic_filter",
+    "improvement_score": 1.7182365405511675,
+    "achieved_threshold": true,
+    "last_updated": "2025-12-05T13:24:51.660033",
+    "usage_count": 0
+  },
+  "5.3_0.0_1.5_1.99": {
+    "sensor_data": {
+      "ph": 5.285923957824707,
+      "TDS": 0.0,
+      "turbidity": 1.520039081573486,
+      "VOC": 1.991000056266785
+    },
+    "best_method": "ultrasonic_filter,activated_carbon,fine_filter",
+    "improvement_score": 0.3372232605842455,
+    "achieved_threshold": true,
+    "last_updated": "2025-12-05T13:28:28.397495",
+    "usage_count": 0
+  },
+  "12.5_10.0_0.9_1.99": {
+    "sensor_data": {
+      "ph": 12.521994590759277,
+      "TDS": 6.258556365966797,
+      "turbidity": 0.938416421413422,
+      "VOC": 1.991000056266785
+    },
+    "best_method": "OFF",
+    "improvement_score": 0.8973769320491255,
+    "achieved_threshold": true,
+    "last_updated": "2025-12-05T13:30:36.996304",
+    "usage_count": 0
+  }
+}
