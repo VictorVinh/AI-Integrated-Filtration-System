@@ -1,0 +1,17 @@
+{
+  "classes": {
+    "0": "activated_carbon",
+    "1": "coarse_filter",
+    "2": "fine_filter",
+    "3": "ro_filter",
+    "4": "ultrasonic_coarse",
+    "5": "ultrasonic_filter",
+    "6": "ultrasonic_fine"
+  },
+  "water_types": {
+    "0": "bestwater",
+    "1": "hardwater",
+    "2": "nothing",
+    "3": "rainwater"
+  }
+}

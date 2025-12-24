@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "scaler_parameters": {
+    "model": {
+      "mean": [
+        5.361176112523446,
+        13.047602915419983,
+        1.1744186544361024,
+        1.0755192598508774
+      ],
+      "scale": [
+        0.7623457414826397,
+        16.087032348895605,
+        0.16523652264452318,
+        0.9506975854632365
+      ]
+    }
+  },
+  "class_names": {
+    "classes": [
+      "bestwater",
+      "hardwater",
+      "nothing",
+      "rainwater"
+    ]
+  },
+  "model_info": {
+    "accuracy": 1.0,
+    "input_features": [
+      "pH",
+      "TDS",
+      "turbidity",
+      "VOC"
+    ],
+    "output_classes": 4
+  }
+}

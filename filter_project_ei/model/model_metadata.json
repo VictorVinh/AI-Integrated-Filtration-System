@@ -1,0 +1,52 @@
+{
+  "model": {
+    "modelVersion": "1",
+    "projectId": 794312,
+    "projectOwner": "water_filtration_system",
+    "projectName": "WaterFiltration_FilterRecommender",
+    "deployVersion": "1",
+    "learnwareVersion": "1",
+    "inputFeatures": [
+      {
+        "name": "pH",
+        "shape": [
+          1
+        ],
+        "type": "float32"
+      },
+      {
+        "name": "TDS",
+        "shape": [
+          1
+        ],
+        "type": "float32"
+      },
+      {
+        "name": "turbidity",
+        "shape": [
+          1
+        ],
+        "type": "float32"
+      },
+      {
+        "name": "VOC",
+        "shape": [
+          1
+        ],
+        "type": "float32"
+      },
+      {
+        "name": "water_type_encoded",
+        "shape": [
+          1
+        ],
+        "type": "float32"
+      }
+    ],
+    "modelType": "classification",
+    "sensor": "WaterQuality",
+    "imageInput": null,
+    "objectDetection": null,
+    "objectDetectionLastLayer": null
+  }
+}

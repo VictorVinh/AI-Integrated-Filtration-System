@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "scaler_parameters": {
+    "model": {
+      "mean": [
+        7.299967534431826,
+        3542.682163998217,
+        11.83897879022064,
+        0.015093339231961529,
+        1.4947916666666667
+      ],
+      "scale": [
+        0.9675564711563105,
+        10317.473890844594,
+        11.211278099787073,
+        0.013910323414437402,
+        1.1189531744435162
+      ]
+    }
+  },
+  "class_names": {
+    "classes": [
+      "activated_carbon",
+      "coarse_filter",
+      "fine_filter",
+      "ro_filter",
+      "ultrasonic_coarse",
+      "ultrasonic_filter",
+      "ultrasonic_fine"
+    ],
+    "water_types": [
+      "bestwater",
+      "hardwater",
+      "nothing",
+      "rainwater"
+    ]
+  },
+  "model_info": {
+    "accuracy": 0.7875,
+    "input_features": [
+      "pH",
+      "TDS",
+      "turbidity",
+      "VOC",
+      "water_type_encoded"
+    ],
+    "output_classes": 7
+  }
+}

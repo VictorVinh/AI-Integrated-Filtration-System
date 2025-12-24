@@ -1,0 +1,8 @@
+{
+  "classes": {
+    "0": "bestwater",
+    "1": "hardwater",
+    "2": "nothing",
+    "3": "rainwater"
+  }
+}

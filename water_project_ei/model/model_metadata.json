@@ -1,0 +1,25 @@
+{
+  "model": {
+    "projectName": "WaterFiltration_WaterClassifier",
+    "inputFeatures": [
+      {
+        "name": "pH",
+        "type": "float32"
+      },
+      {
+        "name": "TDS",
+        "type": "float32"
+      },
+      {
+        "name": "turbidity",
+        "type": "float32"
+      },
+      {
+        "name": "VOC",
+        "type": "float32"
+      }
+    ],
+    "modelType": "classification",
+    "sensor": "WaterQuality"
+  }
+}
