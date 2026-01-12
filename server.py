@@ -14,9 +14,13 @@ import requests
 import pandas as pd
 from ultralytics import YOLO
 import itertools
-from sklearn.ensemble import IsolationForest
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import train_test_split
+import joblib
 import warnings
 warnings.filterwarnings('ignore')
+import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from collections import deque
@@ -24,23 +28,12 @@ import sys
 import signal
 import socket
 import urllib
-try:
-    from scipy.special import softmax as _softmax
-except Exception:
-    def _softmax(x, axis=1):
-        e = np.exp(x - np.max(x, axis=axis, keepdims=True))
-        return e / e.sum(axis=axis, keepdims=True)
 
 try:
     import tensorflow as tf
     TF_AVAILABLE = True
 except ImportError:
     TF_AVAILABLE = False
-
-# Thêm import cho Model 2 mới
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import OneHotEncoder
-import joblib
 
 # ================== CONFIGURATION ==================
 # WiFi Communication
@@ -53,28 +46,28 @@ SENSOR_DATA_URL = f"{ESP32_BASE_URL}/get_sensor"
 COMMAND_URL = f"{ESP32_BASE_URL}/set_command"
 STATUS_URL = f"{ESP32_BASE_URL}/status"
 
-# Root folder config
-ROOT_FOLDER = r'D:\Water Filter'
-
 # Model paths
-YOLO_MODEL_PATH = os.path.join(ROOT_FOLDER, 'my_model', 'my_model.pt')
-MLP_MODEL_1_TFLITE_PATH = os.path.join(ROOT_FOLDER, 'water_project_ei', 'pretrained-model', 'model.tflite')
-MODEL_1_PARAMS_PATH = os.path.join(ROOT_FOLDER, 'water_project_ei', 'model', 'parameters.json')
+YOLO_MODEL_PATH = r'D:\Water Filter\my_model\my_model.pt'
+MLP_MODEL_1_TFLITE_PATH = r'D:\Water Filter\water_project_ei\pretrained-model\model.tflite'
+MODEL_1_PARAMS_PATH = r'D:\Water Filter\water_project_ei\model\parameters.json'
 
-# Path cho Model 2: RandomForest
-MODEL_2_RF_PATH = os.path.join(ROOT_FOLDER, 'filter_project_ei', 'model2_rf.joblib')
-WATER_ENCODER_PATH = os.path.join(ROOT_FOLDER, 'filter_project_ei', 'water_encoder.joblib')
+# Random Forest Model 2
+RANDOM_FOREST_MODEL_PATH = "model2_random_forest.pkl"
+RF_MIN_TRAINING_SAMPLES = 30  # Số mẫu tối thiểu để train
+RF_RETRAIN_INTERVAL_HOURS = 24  # Retrain mỗi 24 giờ
+RF_MIN_NEW_SAMPLES_FOR_RETRAIN = 10  # Số mẫu mới tối thiểu để retrain
 
 AUTO_RETRAIN_MODEL2 = True
 
 # File paths
-WATER_DATA_CSV = os.path.join(ROOT_FOLDER, 'water_data.csv')
-SENSOR_DATA_CSV = os.path.join(ROOT_FOLDER, 'sensor_data.csv')
-TRIAL_RESULTS_CSV = os.path.join(ROOT_FOLDER, 'trial_results.csv')
-FILTER_TRAINING_CSV = os.path.join(ROOT_FOLDER, 'filter_training.csv')
-WATER_SIGNATURES_JSON = os.path.join(ROOT_FOLDER, 'water_signatures.json')
-DISTILLED_REP_CSV = os.path.join(ROOT_FOLDER, 'distilled_representation.csv')
-DATA_TRAINING_READY_FLAG = os.path.join(ROOT_FOLDER, 'data_training_ready.txt')
+WATER_DATA_CSV = r'D:\Water Filter\water_data.csv'
+SENSOR_DATA_CSV = "sensor_data.csv"
+TRIAL_RESULTS_CSV = "trial_results.csv"
+FILTER_TRAINING_CSV = "filter_training.csv"
+WATER_SIGNATURES_JSON = "water_signatures.json"
+DISTILLED_REP_CSV = "distilled_representation.csv"
+DATA_TRAINING_READY_FLAG = "data_training_ready.txt"
+RF_MODEL_INFO_FILE = "rf_model_info.json"
 
 # Relay configuration
 RELAY_ORDER = [
@@ -108,7 +101,7 @@ _interpreter_lock1 = threading.Lock()
 
 trial_cancel_requested = False
 trial_cancel_lock = threading.Lock()
-SKIP_TRIAL_LABELS = {'nothing', 'bestwater'}
+SKIP_TRIAL_LABELS = {'nothing', 'bestwater', 'distilled', 'clean', 'pure'}
 
 # Timing configuration
 TRIAL_STABILIZE_SECONDS = 8
@@ -121,6 +114,10 @@ WATER_CONFIDENCE_THRESHOLD = 0.7
 IMPROVEMENT_THRESHOLD = 0.15
 SENSOR_SIMILARITY_THRESHOLD = 0.92
 
+# RF Model 2 thresholds
+RF_CONFIDENCE_THRESHOLD = 0.6
+RF_UNCERTAINTY_THRESHOLD = 2.0
+
 current_water_type = "Unknown"
 current_water_confidence = 0.0
 current_water_characteristics = []
@@ -129,7 +126,7 @@ current_ood_reasons = []
 current_recommended_method = "OFF"
 current_method_source = "None"
 current_trial_info = {
-    "status": "Idle",  # Idle, Running, Completed, Failed
+    "status": "Idle",  # Idle, Running, Completed, Failed, Cancelled
     "current_trial": 0,
     "total_trials": 0,
     "best_method": "None",
@@ -146,7 +143,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s: %(message)s',
     handlers=[
-        logging.FileHandler(os.path.join(ROOT_FOLDER, 'water_filter_system.log')),
+        logging.FileHandler('water_filter_system.log'),
         logging.StreamHandler()
     ]
 )
@@ -182,21 +179,245 @@ water_signatures_cache = {}
 yolo_model = None
 interp1 = None; input1_details = None; output1_details = None; mean1 = None; scale1 = None; names1 = None
 
-# Model 2 variables
+# Random Forest Model 2
 rf_model2 = None
-water_encoder = None
+rf_scaler2 = None
+rf_label_encoder2 = None
+rf_class_names2 = []
+rf_is_trained = False
+rf_last_training_time = None
+rf_training_samples = 0
 
+# ================== RANDOM FOREST MODEL 2 CLASS ==================
+class RandomForestModel2:
+    """Model 2 sử dụng Random Forest - HOÀN CHỈNH"""
+    
+    def __init__(self):
+        self.model = None
+        self.scaler = None
+        self.label_encoder = None
+        self.class_names = []
+        self.is_trained = False
+        self.last_training_time = None
+        self.training_samples = 0
+        self.training_score = 0.0
+        self.testing_score = 0.0
+        
+    def load(self):
+        """Load model từ file"""
+        try:
+            if os.path.exists(RANDOM_FOREST_MODEL_PATH):
+                model_data = joblib.load(RANDOM_FOREST_MODEL_PATH)
+                self.model = model_data['model']
+                self.scaler = model_data['scaler']
+                self.label_encoder = model_data['label_encoder']
+                self.class_names = model_data['class_names']
+                self.last_training_time = model_data.get('training_time', datetime.now().isoformat())
+                self.training_samples = model_data.get('training_samples', 0)
+                self.training_score = model_data.get('train_score', 0.0)
+                self.testing_score = model_data.get('test_score', 0.0)
+                self.is_trained = True
+                
+                logger.info(f"Random Forest Model 2 loaded: {len(self.class_names)} classes, {self.training_samples} samples")
+                logger.info(f"   Training R²: {self.training_score:.4f}, Testing R²: {self.testing_score:.4f}")
+                return True
+            else:
+                logger.warning("Random Forest Model 2 file not found")
+                return False
+        except Exception as e:
+            logger.error(f"Failed to load Random Forest Model 2: {e}")
+            return False
+    
+    def train(self):
+        """Train model từ training data"""
+        try:
+            if not os.path.exists(FILTER_TRAINING_CSV):
+                logger.warning("No training data available")
+                return False
+            
+            df = pd.read_csv(FILTER_TRAINING_CSV)
+            
+            # Clean data
+            df = df.dropna(subset=['pH', 'TDS_ppm', 'turbidity_NTU', 'VOC_mg_L', 'water_label', 'filter_methods'])
+            
+            if len(df) < RF_MIN_TRAINING_SAMPLES:
+                logger.info(f"Insufficient data: {len(df)}/{RF_MIN_TRAINING_SAMPLES} samples")
+                return False
+            
+            logger.info(f"Training Random Forest Model 2 with {len(df)} samples...")
+            
+            # Prepare features
+            X = df[['pH', 'TDS_ppm', 'turbidity_NTU', 'VOC_mg_L']].values
+            
+            # Encode labels
+            self.label_encoder = LabelEncoder()
+            y = self.label_encoder.fit_transform(df['filter_methods'])
+            self.class_names = self.label_encoder.classes_.tolist()
+            
+            logger.info(f"   Classes: {self.class_names}")
+            
+            # Train-test split
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=0.2, random_state=42, stratify=y
+            )
+            
+            # Scale features
+            self.scaler = StandardScaler()
+            X_train_scaled = self.scaler.fit_transform(X_train)
+            X_test_scaled = self.scaler.transform(X_test)
+            
+            # Train Random Forest
+            self.model = RandomForestRegressor(
+                n_estimators=100,
+                max_depth=10,
+                min_samples_split=5,
+                min_samples_leaf=2,
+                random_state=42,
+                n_jobs=-1,
+                verbose=0
+            )
+            
+            self.model.fit(X_train_scaled, y_train)
+            
+            # Evaluate
+            self.training_score = self.model.score(X_train_scaled, y_train)
+            self.testing_score = self.model.score(X_test_scaled, y_test)
+            
+            # Save model
+            model_data = {
+                'model': self.model,
+                'scaler': self.scaler,
+                'label_encoder': self.label_encoder,
+                'class_names': self.class_names,
+                'training_samples': len(df),
+                'training_time': datetime.now().isoformat(),
+                'train_score': self.training_score,
+                'test_score': self.testing_score,
+                'n_estimators': 100,
+                'feature_names': ['pH', 'TDS_ppm', 'turbidity_NTU', 'VOC_mg_L']
+            }
+            
+            joblib.dump(model_data, RANDOM_FOREST_MODEL_PATH)
+            
+            self.is_trained = True
+            self.last_training_time = datetime.now().isoformat()
+            self.training_samples = len(df)
+            
+            logger.info(f"Random Forest Model 2 trained successfully!")
+            logger.info(f"   Training R²: {self.training_score:.4f}")
+            logger.info(f"   Testing R²: {self.testing_score:.4f}")
+            logger.info(f"   Saved to: {RANDOM_FOREST_MODEL_PATH}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to train Random Forest Model 2: {e}")
+            return False
+    
+    def predict(self, sensor_data):
+        """Dự đoán filter method từ sensor data"""
+        if not self.is_trained or self.model is None:
+            return None, 0.0, 1.0, True  # Not trained = OOD
+        
+        try:
+            # Prepare input
+            features = np.array([
+                sensor_data.get('ph', 0),
+                sensor_data.get('TDS', 0),
+                sensor_data.get('turbidity', 0),
+                sensor_data.get('VOC', 0)
+            ]).reshape(1, -1)
+            
+            # Scale
+            features_scaled = self.scaler.transform(features)
+            
+            # Get predictions from all trees
+            tree_predictions = []
+            for tree in self.model.estimators_:
+                pred = tree.predict(features_scaled)[0]
+                tree_predictions.append(pred)
+            
+            tree_predictions = np.array(tree_predictions)
+            
+            # Calculate statistics
+            pred_mean = np.mean(tree_predictions)
+            pred_std = np.std(tree_predictions)
+            
+            # Get predicted class (sử dụng mode của các cây)
+            from scipy import stats
+            mode_result = stats.mode(np.round(tree_predictions).astype(int))
+            predicted_idx = int(mode_result.mode[0] if len(mode_result.mode) > 0 else np.round(pred_mean))
+            predicted_idx = np.clip(predicted_idx, 0, len(self.class_names) - 1)
+            
+            # Calculate confidence (tỷ lệ cây vote cho class này)
+            votes_for_class = np.sum(np.round(tree_predictions).astype(int) == predicted_idx)
+            confidence = votes_for_class / len(tree_predictions) if len(tree_predictions) > 0 else 0.0
+            
+            # Get class name
+            filter_method = self.class_names[predicted_idx]
+            
+            # Check OOD
+            is_ood = (pred_std > RF_UNCERTAINTY_THRESHOLD) or (confidence < RF_CONFIDENCE_THRESHOLD)
+            
+            return filter_method, confidence, pred_std, is_ood
+            
+        except Exception as e:
+            logger.error(f"Random Forest prediction error: {e}")
+            return None, 0.0, 1.0, True
+    
+    def should_retrain(self):
+        """Kiểm tra xem có nên retrain không"""
+        if not self.is_trained:
+            return True
+        
+        # Check time since last training
+        if self.last_training_time:
+            last_train = datetime.fromisoformat(self.last_training_time)
+            hours_since = (datetime.now() - last_train).total_seconds() / 3600
+            if hours_since >= RF_RETRAIN_INTERVAL_HOURS:
+                logger.info(f"Time to retrain: {hours_since:.1f} hours since last training")
+                return True
+        
+        # Check new data
+        if os.path.exists(FILTER_TRAINING_CSV):
+            df = pd.read_csv(FILTER_TRAINING_CSV)
+            new_samples = len(df) - self.training_samples
+            if new_samples >= RF_MIN_NEW_SAMPLES_FOR_RETRAIN:
+                logger.info(f"Enough new data to retrain: {new_samples} new samples")
+                return True
+        
+        return False
+    
+    def get_info(self):
+        """Lấy thông tin model"""
+        return {
+            'is_trained': self.is_trained,
+            'n_classes': len(self.class_names),
+            'classes': self.class_names,
+            'training_samples': self.training_samples,
+            'last_training': self.last_training_time,
+            'training_score': self.training_score,
+            'testing_score': self.testing_score,
+            'n_trees': len(self.model.estimators_) if self.model else 0
+        }
+
+# Initialize Random Forest Model 2
+rf_model2_handler = RandomForestModel2()
+
+# ================== SMART TRIAL LEARNING SYSTEM ==================
 class SmartTrialLearningSystem:
+    """Hệ thống học từ trial thực tế"""
+    
     def __init__(self):
         self.learning_data = []
         self.trial_history = []
         
         self.base_filters = [
-            "activated_carbon",
-            "coarse_filter",
-            "fine_filter",
-            "ro_filter",
-            "ultrasonic_filter"
+            "activated_carbon",  # Than hoạt tính
+            "coarse_filter",     # Lọc thô
+            "fine_filter",       # Lọc tinh
+            "ro_filter",         # RO
+            "ultrasonic_filter"  # Siêu âm
         ]
         
         self.filter_specialization = {
@@ -208,6 +429,7 @@ class SmartTrialLearningSystem:
         }
         
     def analyze_water_characteristics(self, sensor_data):
+        """Phân tích đặc điểm nước"""
         characteristics = []
         
         if sensor_data.get('TDS', 0) > 300:
@@ -229,89 +451,76 @@ class SmartTrialLearningSystem:
         return characteristics
     
     def suggest_filter_combinations(self, sensor_data, water_type):
-        if rf_model2 is not None:
-            scores, stds, all_combos = self.get_model2_predictions(sensor_data, water_type)
-            acquisition = np.array(scores) + 0.5 * np.array(stds)
-            top_indices = np.argsort(acquisition)[-5:]
-            suggested_combos = []
-            for idx in top_indices[::-1]:
-                combo_tuple = all_combos[idx]
-                if all(v == 0 for v in combo_tuple):
-                    suggested_combos.append(["OFF"])
-                else:
-                    filters = [self.base_filters[i] for i in range(len(self.base_filters)) if combo_tuple[i]]
-                    suggested_combos.append(filters)
-            logger.info(f"Model 2 suggested {len(suggested_combos)} combinations")
-            return suggested_combos
-        else:
-            characteristics = self.analyze_water_characteristics(sensor_data)
-            suggested_combos = []
-            suggested_combos.append(["OFF"])
-            for char in characteristics:
-                if char in self.filter_specialization:
-                    for filter_type in self.filter_specialization[char]:
-                        suggested_combos.append([filter_type])
-            if len(characteristics) >= 2:
-                if "high_tds" in characteristics and "high_voc" in characteristics:
-                    suggested_combos.append(["ro_filter", "activated_carbon"])
-                if "high_turbidity" in characteristics and "high_voc" in characteristics:
-                    suggested_combos.append(["coarse_filter", "activated_carbon"])
-                if "high_turbidity" in characteristics and "high_tds" in characteristics:
-                    suggested_combos.append(["coarse_filter", "ro_filter"])
-            suggested_combos.append(["coarse_filter", "activated_carbon", "ro_filter"])
-            suggested_combos.append(["ultrasonic_filter", "activated_carbon", "fine_filter"])
-            unique_combos = []
-            seen = set()
-            for combo in suggested_combos:
-                combo_key = ','.join(sorted(combo))
-                if combo_key not in seen:
-                    seen.add(combo_key)
-                    unique_combos.append(combo)
-            return unique_combos
-    
-    def get_model2_predictions(self, sensor_data, water_type):
-        n_filters = len(self.base_filters)
-        all_combos = list(itertools.product([0, 1], repeat=n_filters))
-        scores = []
-        stds = []
-        sensor_vec = [sensor_data.get('ph', 0), sensor_data.get('TDS', 0), sensor_data.get('turbidity', 0), sensor_data.get('VOC', 0)]
-        onehot = water_encoder.transform([[water_type]]).toarray().flatten().tolist()
-        for combo_tuple in all_combos:
-            indicators = list(combo_tuple)
-            features = sensor_vec + onehot + indicators
-            pred = rf_model2.predict([features])[0]
-            tree_preds = [tree.predict([features])[0] for tree in rf_model2.estimators_]
-            std = np.std(tree_preds)
-            scores.append(pred)
-            stds.append(std)
-        return scores, stds, all_combos
+        """Đề xuất các tổ hợp lọc"""
+        characteristics = self.analyze_water_characteristics(sensor_data)
+        
+        suggested_combos = []
+        suggested_combos.append(["OFF"])
+        
+        for char in characteristics:
+            if char in self.filter_specialization:
+                for filter_type in self.filter_specialization[char]:
+                    suggested_combos.append([filter_type])
+        
+        if len(characteristics) >= 2:
+            if "high_tds" in characteristics and "high_voc" in characteristics:
+                suggested_combos.append(["ro_filter", "activated_carbon"])
+            if "high_turbidity" in characteristics and "high_voc" in characteristics:
+                suggested_combos.append(["coarse_filter", "activated_carbon"])
+            if "high_turbidity" in characteristics and "high_tds" in characteristics:
+                suggested_combos.append(["coarse_filter", "ro_filter"])
+        
+        suggested_combos.append(["coarse_filter", "activated_carbon", "ro_filter"])
+        suggested_combos.append(["ultrasonic_filter", "activated_carbon", "fine_filter"])
+        
+        unique_combos = []
+        seen = set()
+        for combo in suggested_combos:
+            combo_key = ','.join(sorted(combo))
+            if combo_key not in seen:
+                seen.add(combo_key)
+                unique_combos.append(combo)
+        
+        return unique_combos
     
     def evaluate_filter_performance(self, before_data, after_data):
-        ideal_values = {
-            'ph': 7.0,
-            'TDS': 50,
-            'turbidity': 0.5,
-            'VOC': 0.05
-        }
-        scores = []
-        for param, ideal in ideal_values.items():
-            before_val = before_data.get(param, ideal)
-            after_val = after_data.get(param, ideal)
-            if param == 'ph':
-                before_score = 1 - abs(before_val - ideal) / 7
-                after_score = 1 - abs(after_val - ideal) / 7
-            else:
-                max_val = max(before_val, ideal * 5, 1)
-                before_score = 1 - (before_val / max_val)
-                after_score = 1 - (after_val / max_val)
-            if before_score > 0:
-                improvement = (after_score - before_score) / before_score
-                scores.append(max(0, improvement))
-        if scores:
-            return float(np.mean(scores))
-        return 0.0
+        """Đánh giá hiệu suất của bộ lọc"""
+        try:
+            ideal_values = {
+                'ph': 7.0,
+                'TDS': 50,
+                'turbidity': 0.5,
+                'VOC': 0.05
+            }
+            
+            scores = []
+            
+            for param, ideal in ideal_values.items():
+                before_val = before_data.get(param, ideal)
+                after_val = after_data.get(param, ideal)
+                
+                if param == 'ph':
+                    before_score = 1 - abs(before_val - ideal) / 7
+                    after_score = 1 - abs(after_val - ideal) / 7
+                else:
+                    max_val = max(before_val, ideal * 5, 1)
+                    before_score = 1 - (before_val / max_val)
+                    after_score = 1 - (after_val / max_val)
+                
+                if before_score > 0:
+                    improvement = (after_score - before_score) / before_score
+                    scores.append(max(0, improvement))
+            
+            if scores:
+                return float(np.mean(scores))
+            return 0.0
+            
+        except Exception as e:
+            logger.error(f"Error evaluating filter performance: {e}")
+            return 0.0
     
     def record_trial_result(self, sensor_before, sensor_after, filter_combo, water_type, performance_score):
+        """Ghi lại kết quả trial"""
         trial_result = {
             'timestamp': datetime.now().isoformat(),
             'sensor_before': sensor_before,
@@ -321,206 +530,106 @@ class SmartTrialLearningSystem:
             'performance_score': performance_score,
             'characteristics': self.analyze_water_characteristics(sensor_before)
         }
+        
         self.trial_history.append(trial_result)
+        
         if performance_score > 0.3:
             self.add_to_training_data(trial_result)
+        
         return trial_result
     
     def add_to_training_data(self, trial_result):
+        """Thêm vào training data cho Random Forest"""
         try:
             sensor_before = trial_result['sensor_before']
             filter_combo = trial_result['filter_combo']
             performance = trial_result['performance_score']
-            with csv_lock, open(FILTER_TRAINING_CSV, 'a', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    float(sensor_before.get('ph', 0)),
-                    float(sensor_before.get('TDS', 0)),
-                    float(sensor_before.get('turbidity', 0)),
-                    float(sensor_before.get('VOC', 0)),
-                    trial_result.get('water_type', 'unknown'),
-                    ','.join(filter_combo) if isinstance(filter_combo, list) else filter_combo,
-                    performance
-                ])
-            logger.info(f"Added to training data: {filter_combo} (score: {performance:.3f})")
-            return True
+            
+            if performance > 0.3:
+                filter_method_str = ','.join(filter_combo) if isinstance(filter_combo, list) else filter_combo
+                
+                with csv_lock, open(FILTER_TRAINING_CSV, 'a', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        float(sensor_before.get('ph', 0)),
+                        float(sensor_before.get('TDS', 0)),
+                        float(sensor_before.get('turbidity', 0)),
+                        float(sensor_before.get('VOC', 0)),
+                        trial_result.get('water_type', 'unknown'),
+                        filter_method_str,
+                        performance
+                    ])
+                
+                logger.info(f"Added training data: {filter_method_str} (score: {performance:.3f})")
+                return True
+                
         except Exception as e:
             logger.error(f"Error adding to training data: {e}")
-            return False
+        
+        return False
     
     def get_best_method_for_water(self, sensor_data, water_type):
+        """Tìm phương pháp tốt nhất cho loại nước này"""
         if not self.trial_history:
             return None
+        
         best_score = -1
         best_method = None
+        
         for trial in self.trial_history:
             similarity = self.calculate_sensor_similarity(sensor_data, trial['sensor_before'])
+            
             if similarity > 0.8 and trial['performance_score'] > best_score:
                 best_score = trial['performance_score']
                 best_method = trial['filter_combo']
+        
         return best_method if best_score > 0.5 else None
     
     def calculate_sensor_similarity(self, data1, data2):
+        """Tính độ tương đồng giữa hai sensor data"""
         try:
             params = ['ph', 'TDS', 'turbidity', 'VOC']
             vec1 = [data1.get(p, 0) for p in params]
             vec2 = [data2.get(p, 0) for p in params]
+            
             vec1 = np.array(vec1, dtype=np.float32)
             vec2 = np.array(vec2, dtype=np.float32)
+            
             norm1 = np.linalg.norm(vec1)
             norm2 = np.linalg.norm(vec2)
+            
             if norm1 == 0 or norm2 == 0:
                 return 0.0
+            
             similarity = np.dot(vec1, vec2) / (norm1 * norm2)
             return float(similarity)
+            
         except Exception as e:
             logger.error(f"Error calculating similarity: {e}")
             return 0.0
 
 learning_system = SmartTrialLearningSystem()
 
-class Model2BasedOODDetector:
-    def __init__(self, confidence_threshold=0.6, entropy_threshold=1.5, history_size=100):
-        self.confidence_threshold = confidence_threshold
-        self.entropy_threshold = entropy_threshold
-        self.history_size = history_size
-        self.prediction_history = deque(maxlen=history_size)
-        self.confidence_history = deque(maxlen=history_size)
-        self.stats = {
-            'total_predictions': 0,
-            'ood_count': 0,
-            'avg_confidence': 0.0,
-            'last_update': None
-        }
-        self.stats_file = os.path.join(ROOT_FOLDER, 'model2_ood_stats.json')
-        self.load_stats()
-    
-    def calculate_entropy(self, probabilities):
-        probs = np.clip(probabilities, 1e-10, 1.0)
-        entropy = -np.sum(probs * np.log(probs))
-        return float(entropy)
-    
-    def detect_ood(self, model_output, sensor_data, yolo_count=0):
-        try:
-            max_confidence = float(np.max(model_output))
-            predicted_class = int(np.argmax(model_output))
-            entropy = self.calculate_entropy(model_output[0])
-            top3_probs = np.sort(model_output[0])[-3:][::-1]
-            prob_gap = float(top3_probs[0] - top3_probs[1])
-            historical_confidence = self._get_historical_confidence()
-            confidence_deviation = abs(max_confidence - historical_confidence) if historical_confidence else 0
-            ood_reasons = []
-            is_ood = False
-            if max_confidence < self.confidence_threshold:
-                ood_reasons.append(f"low_confidence({max_confidence:.3f}<{self.confidence_threshold})")
-                is_ood = True
-            if entropy > self.entropy_threshold:
-                ood_reasons.append(f"high_entropy({entropy:.3f}>{self.entropy_threshold})")
-                is_ood = True
-            if prob_gap < 0.1:
-                ood_reasons.append(f"ambiguous_prediction(gap={prob_gap:.3f})")
-                is_ood = True
-            if historical_confidence and confidence_deviation > 0.3:
-                ood_reasons.append(f"unusual_confidence(deviation={confidence_deviation:.3f})")
-                is_ood = True
-            sensor_z_scores = self._calculate_sensor_z_scores(sensor_data)
-            extreme_sensors = [f"{k}(z={v:.1f})" for k, v in sensor_z_scores.items() if abs(v) > 3]
-            if extreme_sensors:
-                ood_reasons.append(f"extreme_sensors:{','.join(extreme_sensors)}")
-                is_ood = True
-            explanation = {
-                'is_ood': is_ood,
-                'ood_score': float(1.0 - max_confidence),
-                'reasons': ood_reasons,
-                'confidence': max_confidence,
-                'predicted_class': predicted_class,
-                'entropy': entropy,
-                'top3_probs': top3_probs.tolist(),
-                'prob_gap': prob_gap,
-                'historical_confidence': historical_confidence,
-                'confidence_deviation': confidence_deviation,
-                'sensor_z_scores': sensor_z_scores,
-                'extreme_sensors': extreme_sensors,
-                'yolo_count': yolo_count,
-                'timestamp': datetime.now().isoformat()
-            }
-            self.prediction_history.append(predicted_class)
-            self.confidence_history.append(max_confidence)
-            self.stats['total_predictions'] += 1
-            if is_ood:
-                self.stats['ood_count'] += 1
-            self.stats['avg_confidence'] = float(np.mean(self.confidence_history)) if self.confidence_history else 0.0
-            self.stats['last_update'] = datetime.now().isoformat()
-            if is_ood:
-                logger.info(f"MODEL2-OOD DETECTED!")
-                logger.info(f"Confidence: {max_confidence:.3f} | Entropy: {entropy:.3f} | Gap: {prob_gap:.3f}")
-                logger.info(f"Reasons: {', '.join(ood_reasons)}")
-                logger.info(f"Top-3 Probs: {top3_probs}")
-                if extreme_sensors:
-                    logger.info(f"   Extreme sensors: {', '.join(extreme_sensors)}")
-            else:
-                logger.debug(f"Normal prediction: class {predicted_class}, conf {max_confidence:.3f}")
-            return is_ood, explanation
-        except Exception as e:
-            logger.error(f"Error in Model2-based OOD detection: {e}")
-            return False, {"error": str(e)}
-    
-    def _get_historical_confidence(self):
-        if len(self.confidence_history) < 10:
-            return None
-        return float(np.mean(self.confidence_history))
-    
-    def _calculate_sensor_z_scores(self, sensor_data):
-        z_scores = {}
-        if len(self.prediction_history) < 20:
-            return z_scores
-        typical_ranges = {
-            'ph': (6.0, 8.0, 7.0, 1.0),
-            'TDS': (0, 300, 100, 80),
-            'turbidity': (0, 5, 2, 1.5),
-            'VOC': (0, 0.3, 0.05, 0.1)
-        }
-        for key, (min_val, max_val, mean, std) in typical_ranges.items():
-            value = sensor_data.get(key, mean)
-            z_score = (value - mean) / (std + 1e-8)
-            z_scores[key] = float(z_score)
-        return z_scores
-    
-    def save_stats(self):
-        try:
-            with open(self.stats_file, 'w') as f:
-                json.dump(self.stats, f, indent=2)
-        except Exception as e:
-            logger.error(f"Error saving Model2-OOD stats: {e}")
-    
-    def load_stats(self):
-        try:
-            if os.path.exists(self.stats_file):
-                with open(self.stats_file, 'r') as f:
-                    self.stats = json.load(f)
-                logger.info(f"Loaded Model2-OOD stats: {self.stats['total_predictions']} predictions")
-        except Exception as e:
-            logger.warning(f"Could not load Model2-OOD stats: {e}")
-    
-    def get_ood_rate(self):
-        if self.stats['total_predictions'] == 0:
-            return 0.0
-        return self.stats['ood_count'] / self.stats['total_predictions']
-
+# ================== SENSOR CALIBRATION SYSTEM ==================
 class SensorCalibrationSystem:
+    """Hệ thống calibration và validation cho sensors"""
+    
     def __init__(self, warm_up_seconds=60, window_size=5, stability_threshold=0.05):
         self.warm_up_seconds = warm_up_seconds
         self.window_size = window_size
         self.stability_threshold = stability_threshold
+        
         self.system_start_time = datetime.now()
         self.is_warmed_up = False
+        
         self.buffers = {
             'ph': deque(maxlen=window_size),
             'TDS': deque(maxlen=window_size),
             'turbidity': deque(maxlen=window_size),
             'VOC': deque(maxlen=window_size)
         }
+        
         self.stats = {
             'total_readings': 0,
             'rejected_warmup': 0,
@@ -528,6 +637,7 @@ class SensorCalibrationSystem:
             'rejected_unstable': 0,
             'accepted_readings': 0
         }
+        
         self.sensor_ranges = {
             'ph': (0.0, 14.0),
             'TDS': (0.0, 2000.0),
@@ -541,99 +651,918 @@ class SensorCalibrationSystem:
     
     def validate_reading(self, sensor_data):
         self.stats['total_readings'] += 1
+        
         if self.is_in_warmup():
             elapsed = (datetime.now() - self.system_start_time).total_seconds()
             remaining = self.warm_up_seconds - elapsed
             self.stats['rejected_warmup'] += 1
             logger.debug(f"Warm-up period: {remaining:.0f}s remaining")
             return False, f"warmup({remaining:.0f}s)", None
-        else:
-            if not self.is_warmed_up:
-                self.is_warmed_up = True
-                logger.info("Sensor warm-up completed!")
+        
+        if not self.is_warmed_up:
+            self.is_warmed_up = True
+            logger.info("Sensor warm-up completed!")
+        
         outliers = []
         for key, value in sensor_data.items():
             if key in self.sensor_ranges:
                 min_val, max_val = self.sensor_ranges[key]
-                if not (min_val <= value <= max_val):
-                    outliers.append(key)
+                if value < min_val or value > max_val:
+                    outliers.append(f"{key}={value:.2f} not in [{min_val},{max_val}]")
+        
         if outliers:
             self.stats['rejected_outlier'] += 1
-            reason = f"outliers: {','.join(outliers)}"
-            logger.debug(f"Rejected: {reason}")
-            return False, reason, None
-        corrected_data = {}
+            logger.warning(f"Outlier detected: {', '.join(outliers)}")
+            return False, f"outlier:{','.join(outliers)}", None
+        
         for key in ['ph', 'TDS', 'turbidity', 'VOC']:
-            value = sensor_data.get(key, 0)
-            self.buffers[key].append(value)
-            corrected_data[key] = float(np.mean(self.buffers[key])) if len(self.buffers[key]) > 1 else value
-        unstable = []
-        for key in corrected_data:
-            if len(self.buffers[key]) == self.window_size:
-                cv = np.std(self.buffers[key]) / (np.mean(self.buffers[key]) + 1e-8)
+            if key in sensor_data:
+                self.buffers[key].append(sensor_data[key])
+        
+        if all(len(self.buffers[key]) >= self.window_size for key in ['ph', 'TDS', 'turbidity', 'VOC']):
+            unstable_sensors = []
+            
+            for key in ['ph', 'TDS', 'turbidity', 'VOC']:
+                values = list(self.buffers[key])
+                mean = np.mean(values)
+                std = np.std(values)
+                
+                cv = std / (mean + 1e-8) if mean != 0 else 0
+                
                 if cv > self.stability_threshold:
-                    unstable.append(key)
-        if unstable:
-            self.stats['rejected_unstable'] += 1
-            reason = f"unstable: {','.join(unstable)}"
-            logger.debug(f"Rejected: {reason}")
-            return False, reason, None
+                    unstable_sensors.append(f"{key}(CV={cv:.3f})")
+            
+            if unstable_sensors:
+                self.stats['rejected_unstable'] += 1
+                logger.debug(f"Unstable sensors: {', '.join(unstable_sensors)}")
+                return False, f"unstable:{','.join(unstable_sensors)}", None
+        
+        smoothed_data = {}
+        for key in ['ph', 'TDS', 'turbidity', 'VOC']:
+            if key in sensor_data and len(self.buffers[key]) > 0:
+                smoothed_data[key] = float(np.mean(self.buffers[key]))
+            else:
+                smoothed_data[key] = sensor_data.get(key, 0.0)
+        
         self.stats['accepted_readings'] += 1
-        return True, "valid", corrected_data
+        logger.debug(f"Valid reading (smoothed)")
+        return True, "valid", smoothed_data
+    
+    def get_acceptance_rate(self):
+        if self.stats['total_readings'] == 0:
+            return 0.0
+        return self.stats['accepted_readings'] / self.stats['total_readings']
+    
+    def get_stats_summary(self):
+        return {
+            'total': self.stats['total_readings'],
+            'accepted': self.stats['accepted_readings'],
+            'acceptance_rate': self.get_acceptance_rate(),
+            'rejected_warmup': self.stats['rejected_warmup'],
+            'rejected_outlier': self.stats['rejected_outlier'],
+            'rejected_unstable': self.stats['rejected_unstable'],
+            'is_warmed_up': self.is_warmed_up
+        }
 
-sensor_calibrator = SensorCalibrationSystem()
+sensor_calibration = SensorCalibrationSystem()
+
+# ================== DATA VALIDATION SYSTEM ==================
+class DataValidationSystem:
+    """Hệ thống validation cho training data"""
+    
+    def __init__(self):
+        self.validation_stats = {
+            'total_samples': 0,
+            'invalid_samples': 0,
+            'duplicate_samples': 0,
+            'nothing_samples': 0,
+            'valid_samples': 0
+        }
+    
+    def validate_training_data(self, csv_path, output_path=None):
+        try:
+            df = pd.read_csv(csv_path)
+            logger.info(f"Validating {len(df)} training samples...")
+            
+            self.validation_stats['total_samples'] = len(df)
+            original_count = len(df)
+            
+            nothing_mask = df['water_label'] == 'nothing'
+            nothing_samples = df[nothing_mask]
+            
+            valid_nothing = []
+            for idx, row in nothing_samples.iterrows():
+                ph_bad = row['pH'] < 4 or row['pH'] > 10
+                tds_bad = row['TDS_ppm'] > 500
+                turbidity_bad = row['turbidity_NTU'] > 10
+                voc_bad = row['VOC_mg_L'] > 1.0
+                
+                if ph_bad or tds_bad or turbidity_bad or voc_bad:
+                    valid_nothing.append(idx)
+            
+            invalid_nothing = nothing_samples[~nothing_samples.index.isin(valid_nothing)]
+            if len(invalid_nothing) > 0:
+                logger.warning(f"Removing {len(invalid_nothing)} invalid 'nothing' samples")
+                df = df[~df.index.isin(invalid_nothing.index)]
+                self.validation_stats['invalid_samples'] += len(invalid_nothing)
+            
+            self.validation_stats['nothing_samples'] = len(valid_nothing)
+            
+            sensor_cols = ['pH', 'TDS_ppm', 'turbidity_NTU', 'VOC_mg_L']
+            duplicates = df.duplicated(subset=sensor_cols, keep='first')
+            if duplicates.sum() > 0:
+                logger.warning(f"Removing {duplicates.sum()} duplicate samples")
+                df = df[~duplicates]
+                self.validation_stats['duplicate_samples'] = duplicates.sum()
+            
+            outlier_mask = (
+                (df['pH'] < 0) | (df['pH'] > 14) |
+                (df['TDS_ppm'] < 0) | (df['TDS_ppm'] > 2000) |
+                (df['turbidity_NTU'] < 0) | (df['turbidity_NTU'] > 100) |
+                (df['VOC_mg_L'] < 0) | (df['VOC_mg_L'] > 10)
+            )
+            
+            if outlier_mask.sum() > 0:
+                logger.warning(f"Removing {outlier_mask.sum()} outlier samples")
+                df = df[~outlier_mask]
+                self.validation_stats['invalid_samples'] += outlier_mask.sum()
+            
+            valid_methods = set(RELAY_COMMAND_MAP.keys()) - {'OFF'}
+            valid_combos = [','.join(combo) for combo in FILTER_COMBINATIONS]
+            all_valid = list(valid_methods) + valid_combos
+            
+            invalid_methods = ~df['filter_methods'].isin(all_valid)
+            if invalid_methods.sum() > 0:
+                logger.warning(f"Removing {invalid_methods.sum()} samples with invalid filter methods")
+                df = df[~invalid_methods]
+                self.validation_stats['invalid_samples'] += invalid_methods.sum()
+            
+            self.validation_stats['valid_samples'] = len(df)
+            
+            logger.info("=" * 60)
+            logger.info("TRAINING DATA VALIDATION REPORT")
+            logger.info("=" * 60)
+            logger.info(f"Original samples:        {original_count}")
+            logger.info(f"Valid samples:           {len(df)} ({len(df)/original_count*100:.1f}%)")
+            logger.info(f"Removed - Invalid:       {self.validation_stats['invalid_samples']}")
+            logger.info(f"Removed - Duplicates:    {self.validation_stats['duplicate_samples']}")
+            logger.info(f"Valid 'nothing' samples: {self.validation_stats['nothing_samples']}")
+            logger.info("=" * 60)
+            
+            logger.info("\nClass Distribution:")
+            water_dist = df['water_label'].value_counts()
+            for label, count in water_dist.items():
+                logger.info(f"  {label}: {count} samples ({count/len(df)*100:.1f}%)")
+            
+            logger.info("\nFilter Method Distribution:")
+            method_dist = df['filter_methods'].value_counts().head(10)
+            for method, count in method_dist.items():
+                logger.info(f"  {method}: {count} samples ({count/len(df)*100:.1f}%)")
+            
+            output_path = output_path or csv_path
+            df.to_csv(output_path, index=False)
+            logger.info(f"\nCleaned data saved to: {output_path}")
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error validating training data: {e}")
+            return None
+    
+    def check_if_ready_for_training(self, csv_path, min_samples=100, min_classes=3):
+        try:
+            df = pd.read_csv(csv_path)
+            
+            if len(df) < min_samples:
+                return False, f"Not enough samples: {len(df)}/{min_samples}", None
+            
+            n_classes = df['water_label'].nunique()
+            if n_classes < min_classes:
+                return False, f"Not enough classes: {n_classes}/{min_classes}", None
+            
+            class_counts = df['water_label'].value_counts()
+            min_class_count = class_counts.min()
+            max_class_count = class_counts.max()
+            imbalance_ratio = max_class_count / (min_class_count + 1e-8)
+            
+            if imbalance_ratio > 10:
+                return False, f"Severe class imbalance: {imbalance_ratio:.1f}x", None
+            
+            n_methods = df['filter_methods'].nunique()
+            if n_methods < 3:
+                return False, f"Not enough filter methods: {n_methods}/3", None
+            
+            stats = {
+                'total_samples': len(df),
+                'n_classes': n_classes,
+                'n_methods': n_methods,
+                'imbalance_ratio': imbalance_ratio,
+                'class_distribution': class_counts.to_dict()
+            }
+            
+            return True, "Ready for training", stats
+            
+        except Exception as e:
+            logger.error(f"Error checking training readiness: {e}")
+            return False, f"Error: {str(e)}", None
+
+data_validator = DataValidationSystem()
+
+# ================== NETWORK FUNCTIONS ==================
+class TimeoutSession(requests.Session):
+    def __init__(self, default_timeout=(2, 5)):
+        super().__init__()
+        self.default_timeout = default_timeout
+    
+    def request(self, method, url, **kwargs):
+        if 'timeout' not in kwargs:
+            kwargs['timeout'] = self.default_timeout
+        return super().request(method, url, **kwargs)
+
+def create_optimized_session():
+    session = TimeoutSession(default_timeout=(2, 3))
+    
+    retry_strategy = Retry(
+        total=1,
+        backoff_factor=0.1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"]
+    )
+    
+    adapter = HTTPAdapter(
+        pool_connections=1,
+        pool_maxsize=1,
+        max_retries=retry_strategy
+    )
+    
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    return session
+
+esp32_session = create_optimized_session()
 
 def get_sensor_data_from_arduino():
+    """Get sensor data từ Arduino Uno"""
     try:
-        response = requests.get(SENSOR_DATA_URL, timeout=5)
+        response = esp32_session.get(SENSOR_DATA_URL, timeout=2)
+        
         if response.status_code == 200:
-            raw_data = response.json()
-            is_valid, reason, validated_data = sensor_calibrator.validate_reading(raw_data)
-            if is_valid:
-                logger.debug("Valid sensor data received")
-                return validated_data
-            else:
-                logger.warning(f"Invalid sensor data: {reason}")
+            sensor_data = response.json()
+            
+            if isinstance(sensor_data, dict) and 'error' in sensor_data:
+                logger.debug(f"Sensor error: {sensor_data['error']}")
                 return None
+            
+            processed_data = {}
+            if 'ph' in sensor_data:
+                processed_data['ph'] = float(sensor_data['ph'])
+            if 'tds' in sensor_data:
+                processed_data['TDS'] = float(sensor_data['tds'])
+            elif 'TDS' in sensor_data:
+                processed_data['TDS'] = float(sensor_data['TDS'])
+            if 'turbidity' in sensor_data:
+                processed_data['turbidity'] = float(sensor_data['turbidity'])
+            if 'voc' in sensor_data:
+                processed_data['VOC'] = float(sensor_data['voc'])
+            elif 'VOC' in sensor_data:
+                processed_data['VOC'] = float(sensor_data['VOC'])
+            
+            logger.info(f"Raw sensor data: {sensor_data}")
+            logger.info(f"Processed sensor data: {processed_data}")
+            
+            return processed_data
+            
         else:
-            logger.warning(f"Failed to get sensor data: HTTP {response.status_code}")
+            logger.warning(f"No sensor data (HTTP {response.status_code})")
             return None
+            
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Sensor data request failed: {e}")
+        return None
     except Exception as e:
-        logger.error(f"Error getting sensor data: {e}")
+        logger.error(f"Unexpected error getting sensor data: {e}")
         return None
 
 def send_command_to_arduino(command_chars):
+    """Gửi command đến Arduino"""
     try:
-        response = requests.get(f"{COMMAND_URL}?cmd={command_chars}", timeout=5)
+        if not command_chars.startswith("CHARS:"):
+            command_chars = f"CHARS:{command_chars}"
+            
+        logger.info(f"Sending command: {command_chars}")
+        
+        response = esp32_session.post(COMMAND_URL, 
+                                     data=command_chars, 
+                                     headers={'Content-Type': 'text/plain'},
+                                     timeout=2)
+        
         if response.status_code == 200:
             logger.info(f"Command sent: {command_chars}")
-            with state_lock:
-                global current_command_chars
-                current_command_chars = command_chars
             return True
         else:
-            logger.warning(f"Failed to send command: HTTP {response.status_code}")
+            logger.warning(f"Command send failed with status: {response.status_code}")
             return False
+            
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Command send failed: {e}")
+        return False
     except Exception as e:
-        logger.error(f"Error sending command: {e}")
+        logger.warning(f"Unexpected error sending command: {e}")
         return False
 
-def apply_filter_combination(combo):
-    if combo == ["OFF"]:
-        send_command_to_arduino("abcdefg")
-        return "OFF"
+def apply_filter_method(method_name):
+    """Áp dụng filter method"""
+    if method_name in RELAY_COMMAND_MAP:
+        relay_set = RELAY_COMMAND_MAP[method_name]
+        command_chars = "".join([ch.upper() if r in relay_set else ch.lower() for r, ch in RELAY_ORDER])
+        success = send_command_to_arduino(command_chars)
+        
+        if success:
+            global current_command_chars, current_relay_state
+            with state_lock:
+                current_command_chars = command_chars
+                current_relay_state = method_name
+            logger.info(f"Applied filter method: {method_name}")
+            return True
+        else:
+            logger.error(f"Failed to apply filter method: {method_name}")
+            return False
     else:
-        relay_set = set()
-        for method in combo:
-            relay_set |= RELAY_COMMAND_MAP.get(method, set())
-        command_chars = "".join([
-            ch.upper() if r in relay_set else ch.lower()
-            for r, ch in RELAY_ORDER
-        ])
-        send_command_to_arduino(f"CHARS:{command_chars}")
-        return ",".join(combo)
+        logger.warning(f"Unknown filter method: {method_name}")
+        return False
+
+# ================== VIDEO STREAM FUNCTIONS ==================
+def optimized_video_stream():
+    global stream_active, latest_frame
+    
+    while system_running:
+        try:
+            if not stream_active:
+                time.sleep(0.5)
+                continue
+                
+            logger.info("Connecting to camera stream...")
+            
+            cap = cv2.VideoCapture(STREAM_URL)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            
+            if not cap.isOpened():
+                logger.warning("Cannot connect to camera stream")
+                time.sleep(2)
+                continue
+            
+            logger.info("Camera stream connected!")
+            
+            frame_count = 0
+            last_success_time = time.time()
+            
+            while system_running and stream_active:
+                try:
+                    ret, frame = cap.read()
+                    if not ret:
+                        if time.time() - last_success_time > 5:
+                            logger.warning("Stream timeout, reconnecting...")
+                            break
+                        continue
+                    
+                    frame_count += 1
+                    last_success_time = time.time()
+                    
+                    with frame_lock:
+                        latest_frame = frame.copy()
+                    
+                    del frame
+                    time.sleep(0.2)
+                    
+                except Exception as e:
+                    logger.error(f"Error reading frame: {e}")
+                    break
+                
+            cap.release()
+            logger.info(f"Stream ended ({frame_count} frames)")
+            time.sleep(1)
+            
+        except Exception as e:
+            logger.error(f"Stream error: {e}")
+            time.sleep(2)
+
+def optimized_yolo_processing():
+    """Xử lý YOLO trên frame từ video stream"""
+    global latest_frame, latest_frame_with_boxes, yolo_detections
+    
+    while system_running:
+        try:
+            with frame_lock:
+                frame = latest_frame.copy() if latest_frame is not None else None
+            
+            if frame is None:
+                time.sleep(0.1)
+                continue
+
+            detections = []
+            if yolo_model:
+                try:
+                    results = yolo_model(frame, imgsz=320, conf=0.25, iou=0.45, verbose=False, device='cpu')
+                    
+                    for result in results:
+                        if result.boxes is not None:
+                            for box in result.boxes:
+                                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                                conf = box.conf[0].cpu().numpy()
+                                cls = int(box.cls[0].cpu().numpy())
+                                class_name = yolo_model.names[cls]
+                                
+                                if conf > 0.3:
+                                    detections.append({
+                                        'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                                        'confidence': float(conf),
+                                        'class': class_name,
+                                        'class_id': cls
+                                    })
+                except Exception as e:
+                    logger.error(f"YOLO inference error: {e}")
+
+            with state_lock:
+                yolo_detections = detections
+            
+            if frame is not None:
+                display_frame = frame.copy()
+                for det in detections:
+                    x1, y1, x2, y2 = det['bbox']
+                    conf = det['confidence']
+                    class_name = det['class']
+                    
+                    color = (0, 255, 0) if 'bacteria' in class_name.lower() else (255, 0, 0)
+                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
+                    label = f"{class_name} {conf:.2f}"
+                    label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+                    cv2.rectangle(display_frame, (x1, y1 - label_size[1] - 10), (x1 + label_size[0], y1), color, -1)
+                    cv2.putText(display_frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                
+                with frame_lock:
+                    latest_frame_with_boxes = display_frame
+                
+        except Exception as e:
+            logger.error(f"YOLO processing error: {e}")
+            time.sleep(0.1)
+        
+        time.sleep(0.1)
+
+# ================== DATA MANAGEMENT FUNCTIONS ==================
+def ensure_data_files():
+    """Đảm bảo các file dữ liệu tồn tại"""
+    files_config = [
+        (SENSOR_DATA_CSV, ["timestamp", "pH", "TDS_ppm", "turbidity_NTU", "VOC_mg_L"]),
+        (TRIAL_RESULTS_CSV, ["timestamp", "combo", "pH_before", "TDS_before", "turbidity_before", "VOC_before", 
+                           "pH_after", "TDS_after", "turbidity_after", "VOC_after", "improvement", "accepted"]),
+        (FILTER_TRAINING_CSV, ["timestamp", "pH", "TDS_ppm", "turbidity_NTU", "VOC_mg_L", "water_label", "filter_methods", "performance"]),
+        (DISTILLED_REP_CSV, ["parameter", "mean_value", "std_value", "count", "timestamp"])
+    ]
+    
+    for filepath, headers in files_config:
+        try:
+            if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
+                with open(filepath, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(headers)
+                logger.info(f"Created {filepath}")
+        except Exception as e:
+            logger.error(f"Error creating {filepath}: {e}")
+
+def append_sensor_data(sensor_data):
+    """Thêm dữ liệu cảm biến vào CSV"""
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with csv_lock, open(SENSOR_DATA_CSV, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                timestamp,
+                float(sensor_data.get('ph', 0.0)),
+                float(sensor_data.get('TDS', sensor_data.get('tds', 0.0))),
+                float(sensor_data.get('turbidity', 0.0)),
+                float(sensor_data.get('VOC', sensor_data.get('voc', 0.0)))
+            ])
+        return True
+    except Exception as e:
+        logger.error(f"Error appending sensor data: {e}")
+        return False
+
+def append_trial_result(trial_data):
+    """Thêm kết quả trial vào CSV"""
+    try:
+        with csv_lock, open(TRIAL_RESULTS_CSV, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(trial_data)
+        return True
+    except Exception as e:
+        logger.error(f"Error appending trial result: {e}")
+        return False
+
+def append_filter_training(sensor_data, water_label, filter_method):
+    """Thêm dữ liệu training vào CSV"""
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with csv_lock, open(FILTER_TRAINING_CSV, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                timestamp,
+                float(sensor_data.get('ph', 0.0)),
+                float(sensor_data.get('TDS', sensor_data.get('tds', 0.0))),
+                float(sensor_data.get('turbidity', 0.0)),
+                float(sensor_data.get('VOC', sensor_data.get('voc', 0.0))),
+                str(water_label),
+                str(filter_method),
+                1.0  # Performance mặc định cho positive sample
+            ])
+        logger.info(f"Added training data: {water_label} -> {filter_method}")
+        
+        # Trigger retrain check
+        check_and_retrain_rf_model()
+        
+        return True
+    except Exception as e:
+        logger.error(f"Error appending filter training: {e}")
+        return False
+
+def load_yolo_model():
+    """Tải mô hình YOLO"""
+    global yolo_model
+    try:
+        yolo_model = YOLO(YOLO_MODEL_PATH)
+        logger.info(f"YOLO model loaded: {YOLO_MODEL_PATH}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to load YOLO model: {e}")
+        return False
+
+def load_tflite_model(model_path):
+    """Load TFLite model (Model 1)"""
+    try:
+        if not os.path.exists(model_path):
+            logger.warning(f"Model file not found: {model_path}")
+            return None, None, None
+            
+        interpreter = tf.lite.Interpreter(model_path=model_path)
+        interpreter.allocate_tensors()
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+        return interpreter, input_details, output_details
+    except Exception as e:
+        logger.error(f"Error loading TFLite model {model_path}: {e}")
+        return None, None, None
+
+def load_model_params(params_path):
+    """Tải tham số mô hình"""
+    try:
+        with open(params_path, 'r', encoding='utf-8') as f:
+            params = json.load(f)
+        
+        scaler_params = params.get('scaler_parameters', {}).get('model', {})
+        mean = np.array(scaler_params.get('mean', []), dtype=np.float32)
+        scale = np.array(scaler_params.get('scale', []), dtype=np.float32)
+        
+        class_names = params.get('class_names', {}).get('classes', [])
+        
+        return mean, scale, class_names
+    except Exception as e:
+        logger.error(f"Error loading model params {params_path}: {e}")
+        return None, None, None
+
+def predict_with_model(interpreter, input_details, output_details, normalized_input, apply_softmax=True):
+    """Dự đoán với TFLite model"""
+    data = np.asarray(normalized_input, dtype=np.float32)
+    if data.ndim == 1:
+        data = np.expand_dims(data, axis=0)
+
+    in_quant = input_details[0].get('quantization', (0.0,0))
+    out_quant = output_details[0].get('quantization', (0.0,0))
+    in_scale, in_zero = (in_quant if isinstance(in_quant, (list,tuple)) else (0.0,0))
+    out_scale, out_zero = (out_quant if isinstance(out_quant, (list,tuple)) else (0.0,0))
+
+    try:
+        with _interpreter_lock1:
+            if in_scale and in_scale != 0:
+                q = np.round(data / in_scale + in_zero).astype(input_details[0]['dtype'])
+                interpreter.set_tensor(input_details[0]['index'], q)
+            else:
+                interpreter.set_tensor(input_details[0]['index'], data.astype(input_details[0]['dtype']))
+
+            interpreter.invoke()
+            raw_out = interpreter.get_tensor(output_details[0]['index']).copy()
+
+        if out_scale and out_scale != 0:
+            pred = (raw_out.astype(np.float32) - out_zero) * out_scale
+        else:
+            pred = raw_out.astype(np.float32)
+
+        if pred.ndim == 1:
+            pred = np.expand_dims(pred, axis=0)
+
+        logger.debug(f"_tflite_predict raw_out = {raw_out}")
+        logger.debug(f"_tflite_predict dequantized = {pred}")
+
+        if apply_softmax:
+            if not np.allclose(pred.sum(axis=1), 1.0, atol=1e-3):
+                e = np.exp(pred - np.max(pred, axis=1, keepdims=True))
+                pred = e / e.sum(axis=1, keepdims=True)
+
+        return pred
+
+    except Exception as e:
+        logger.exception(f"_tflite_predict error: {e}")
+        return None
+
+def classify_water_with_model1(sensor_data):
+    """Phân loại nước bằng Model 1"""
+    global interp1, input1_details, output1_details, mean1, scale1, names1, _prediction_history
+
+    if interp1 is None or input1_details is None or output1_details is None or mean1 is None or scale1 is None or names1 is None:
+        logger.error("Model1 not initialized")
+        return "Unknown", 0.0, None
+
+    try:
+        x = np.array([
+            sensor_data.get('ph', 0.0),
+            sensor_data.get('TDS', 0.0),
+            sensor_data.get('turbidity', 0.0),
+            sensor_data.get('VOC', 0.0)
+        ], dtype=np.float32)
+
+        logger.debug(f"[MODEL1] raw sensor: {x.tolist()}")
+
+        m = np.asarray(mean1, dtype=np.float32)
+        s = np.asarray(scale1, dtype=np.float32)
+
+        if m.size != x.size or s.size != x.size:
+            logger.warning(f"[MODEL1] mean/scale length mismatch (mean={m.size}, scale={s.size}, x={x.size}). Adjusting.")
+            target = x.size
+            if m.size < target:
+                m = np.pad(m, (0, target - m.size), 'constant', constant_values=0.0)
+            else:
+                m = m[:target]
+            if s.size < target:
+                s = np.pad(s, (0, target - s.size), 'constant', constant_values=1.0)
+            else:
+                s = s[:target]
+
+        denom = np.where(s == 0, 1.0, s)
+        x_norm = (x - m) / denom
+        logger.debug(f"[MODEL1] normalized input: {x_norm.tolist()}")
+
+        probs = predict_with_model(interp1, input1_details, output1_details, x_norm.reshape(1, -1))
+        if probs is None:
+            logger.error("[MODEL1] Prediction returned None")
+            return "Unknown", 0.0, None
+
+        logger.debug(f"[MODEL1] probs: {probs}")
+
+        idx = int(np.argmax(probs, axis=1)[0])
+        conf = float(np.max(probs, axis=1)[0])
+        label = names1[idx] if idx < len(names1) else str(idx)
+
+        _prediction_history.append((idx, conf, x.tolist()))
+        if len(_prediction_history) == _prediction_history.maxlen:
+            same_high = sum(1 for p in _prediction_history if p[0] == idx and p[1] > 0.99)
+            if same_high >= int(_prediction_history.maxlen * 0.8):
+                sens = np.array([p[2] for p in _prediction_history], dtype=np.float32)
+                if np.any(np.var(sens, axis=0) > 1e-4):
+                    logger.warning("[MODEL1] Detected stuck predictions despite sensor changes. Degrading confidence.")
+                    conf = min(conf, 0.6)
+
+        logger.info(f"[MODEL1] label={label}, conf={conf:.3f}")
+        return label, conf, probs
+
+    except Exception as e:
+        logger.error(f"[MODEL1] classify error: {e}")
+        return "Unknown", 0.0, None
+
+def initialize_models():
+    """Khởi tạo tất cả mô hình AI"""
+    global interp1, input1_details, output1_details, mean1, scale1, names1
+    
+    load_yolo_model()
+    
+    if TF_AVAILABLE:
+        interp1, input1_details, output1_details = load_tflite_model(MLP_MODEL_1_TFLITE_PATH)
+        if interp1:
+            mean1, scale1, names1 = load_model_params(MODEL_1_PARAMS_PATH)
+            logger.info(f"Model 1 loaded successfully - Names: {names1}")
+
+# ================== WATER SIGNATURES FUNCTIONS ==================
+def load_water_signatures():
+    """Tải water signatures từ file"""
+    global water_signatures_cache
+    try:
+        if os.path.exists(WATER_SIGNATURES_JSON):
+            with open(WATER_SIGNATURES_JSON, 'r', encoding='utf-8') as f:
+                water_signatures_cache = json.load(f)
+            logger.info(f"Loaded {len(water_signatures_cache)} water signatures")
+            return water_signatures_cache
+        return {}
+    except Exception as e:
+        logger.error(f"Error loading water signatures: {e}")
+        return {}
+
+def save_water_signatures():
+    """Lưu water signatures vào file"""
+    try:
+        with open(WATER_SIGNATURES_JSON, 'w', encoding='utf-8') as f:
+            json.dump(water_signatures_cache, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Error saving water signatures: {e}")
+
+def create_water_signature(sensor_data):
+    """Tạo signature từ dữ liệu cảm biến"""
+    try:
+        ph = round(sensor_data.get('ph', 0), 1)
+        tds = round(sensor_data.get('TDS', 0), -1)
+        turbidity = round(sensor_data.get('turbidity', 0), 1)
+        voc = round(sensor_data.get('VOC', 0), 2)
+        return f"{ph}_{tds}_{turbidity}_{voc}"
+    except Exception as e:
+        logger.error(f"Error creating water signature: {e}")
+        return "unknown"
+
+def find_similar_water_signature(current_sensor_data, threshold=0.95):
+    """Tìm water signature tương tự"""
+    global water_signatures_cache
+    
+    if not water_signatures_cache:
+        return None
+    
+    current_signature = create_water_signature(current_sensor_data)
+    best_similarity = 0
+    best_match = None
+    
+    for signature, data in water_signatures_cache.items():
+        stored_sensor_data = data.get('sensor_data', {})
+        similarity = calculate_sensor_similarity(current_sensor_data, stored_sensor_data)
+        
+        if similarity > best_similarity and similarity >= threshold:
+            best_similarity = similarity
+            best_match = data
+    
+    if best_match:
+        logger.info(f"Found similar water signature: similarity {best_similarity:.3f}")
+        return best_match
+    
+    return None
+
+def calculate_sensor_similarity(sensor_data1, sensor_data2):
+    """Tính độ tương đồng giữa hai sensor data"""
+    try:
+        features1 = [sensor_data1.get('ph', 0), sensor_data1.get('TDS', 0), 
+                    sensor_data1.get('turbidity', 0), sensor_data1.get('VOC', 0)]
+        features2 = [sensor_data2.get('ph', 0), sensor_data2.get('TDS', 0), 
+                    sensor_data2.get('turbidity', 0), sensor_data2.get('VOC', 0)]
+        
+        features1 = np.array(features1)
+        features2 = np.array(features2)
+        
+        norm1 = np.linalg.norm(features1)
+        norm2 = np.linalg.norm(features2)
+        
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+            
+        cosine_sim = np.dot(features1, features2) / (norm1 * norm2)
+        return max(0.0, min(1.0, cosine_sim))
+        
+    except Exception as e:
+        logger.error(f"Error calculating sensor similarity: {e}")
+        return 0.0
+
+def update_water_signature(sensor_data, best_method, improvement_score, achieved_threshold=False):
+    """Cập nhật water signature"""
+    global water_signatures_cache
+    
+    signature = create_water_signature(sensor_data)
+    
+    current_data = {
+        'sensor_data': sensor_data,
+        'best_method': best_method,
+        'improvement_score': improvement_score,
+        'achieved_threshold': achieved_threshold,
+        'last_updated': datetime.now().isoformat(),
+        'usage_count': 0
+    }
+    
+    if signature in water_signatures_cache:
+        existing_data = water_signatures_cache[signature]
+        if improvement_score > existing_data.get('improvement_score', 0):
+            water_signatures_cache[signature] = current_data
+            logger.info(f"Updated water signature: {best_method} (improvement: {improvement_score:.3f})")
+    else:
+        water_signatures_cache[signature] = current_data
+        logger.info(f"Created new water signature: {best_method} (improvement: {improvement_score:.3f})")
+    
+    save_water_signatures()
+    return True
+
+# ================== RANDOM FOREST MODEL 2 FUNCTIONS ==================
+def check_and_retrain_rf_model():
+    """Kiểm tra và retrain Random Forest model nếu cần"""
+    try:
+        if not AUTO_RETRAIN_MODEL2:
+            return
+        
+        if rf_model2_handler.should_retrain():
+            logger.info("Random Forest Model 2 needs retraining...")
+            
+            def retrain_worker():
+                try:
+                    success = rf_model2_handler.train()
+                    if success:
+                        logger.info("Random Forest Model 2 retrained successfully!")
+                    else:
+                        logger.warning("Random Forest Model 2 retraining failed")
+                except Exception as e:
+                    logger.error(f"Error in retrain worker: {e}")
+            
+            thread = threading.Thread(target=retrain_worker, daemon=True)
+            thread.start()
+            
+    except Exception as e:
+        logger.error(f"Error checking retrain: {e}")
+
+def initialize_rf_model():
+    """Khởi tạo Random Forest Model 2"""
+    logger.info("Initializing Random Forest Model 2...")
+    
+    # Thử load model đã train
+    loaded = rf_model2_handler.load()
+    
+    if not loaded:
+        logger.info("No trained model found, attempting to train...")
+        
+        # Kiểm tra xem có đủ data để train không
+        if os.path.exists(FILTER_TRAINING_CSV):
+            df = pd.read_csv(FILTER_TRAINING_CSV)
+            if len(df) >= RF_MIN_TRAINING_SAMPLES:
+                logger.info(f"Found {len(df)} training samples, training model...")
+                success = rf_model2_handler.train()
+                if success:
+                    logger.info("Random Forest Model 2 trained successfully!")
+                else:
+                    logger.warning("Random Forest Model 2 training failed")
+            else:
+                logger.info(f"Not enough training samples: {len(df)}/{RF_MIN_TRAINING_SAMPLES}")
+        else:
+            logger.info("No training data file found")
+    
+    # Log model info
+    model_info = rf_model2_handler.get_info()
+    logger.info(f"Random Forest Model 2 Status: {'TRAINED' if model_info['is_trained'] else 'NOT TRAINED'}")
+    if model_info['is_trained']:
+        logger.info(f"  - Classes: {model_info['n_classes']}")
+        logger.info(f"  - Training samples: {model_info['training_samples']}")
+        logger.info(f"  - Last training: {model_info['last_training']}")
+
+# ================== TRIAL FUNCTIONS ==================
+def should_skip_trial(water_label: str) -> bool:
+    """Kiểm tra xem có nên bỏ qua trial không"""
+    if not water_label:
+        return False
+    label = str(water_label).strip().lower()
+    return label in SKIP_TRIAL_LABELS
+
+def has_good_known_solution(sensor_data, water_type):
+    """Kiểm tra xem có phương pháp tốt đã biết cho loại nước này chưa"""
+    if not learning_system.trial_history:
+        return False, None
+    
+    best_from_history = learning_system.get_best_method_for_water(sensor_data, water_type)
+    if best_from_history and learning_system.calculate_sensor_similarity(
+        sensor_data, learning_system.trial_history[-1]['sensor_before'] if learning_system.trial_history else sensor_data
+    ) > 0.85:
+        return True, best_from_history
+
+    similar_sig = find_similar_water_signature(sensor_data, threshold=SENSOR_SIMILARITY_THRESHOLD)
+    if similar_sig and similar_sig.get('achieved_threshold', False):
+        return True, similar_sig['best_method']
+    
+    return False, None
+
+def apply_filter_method_from_name(method_name):
+    """Áp dụng phương pháp lọc từ tên"""
+    if isinstance(method_name, str) and ',' in method_name:
+        combo_methods = [m.strip() for m in method_name.split(',')]
+        apply_filter_combination(combo_methods)
+    else:
+        apply_filter_method(method_name)
+
+def apply_filter_combination(combo):
+    """Áp dụng tổ hợp lọc"""
+    relay_set = set()
+    for method in combo:
+        relay_set |= RELAY_COMMAND_MAP.get(method, set())
+    
+    command_chars = "".join([ch.upper() if r in relay_set else ch.lower() for r, ch in RELAY_ORDER])
+    send_command_to_arduino(command_chars)
 
 def start_smart_trial_v2(initial_sensor, water_type, characteristics):
+    """Smart Trial phiên bản 2"""
     global trial_in_progress, current_trial_info, trial_cancel_requested
 
     def trial_worker():
@@ -738,7 +1667,7 @@ def start_smart_trial_v2(initial_sensor, water_type, characteristics):
                 update_water_signature(
                     sensor_data=initial_sensor,
                     best_method=method_name,
-                    score=best_score,
+                    improvement_score=best_score,
                     achieved_threshold=True
                 )
 
@@ -746,6 +1675,9 @@ def start_smart_trial_v2(initial_sensor, water_type, characteristics):
                 current_method_source = "SmartTrial_Success"
                 current_trial_info["status"] = "Completed"
 
+                # Add to training data
+                append_filter_training(initial_sensor, water_type, method_name)
+                
             else:
                 logger.warning("Trial failed - No good method found")
                 send_command_to_arduino("abcdefg")
@@ -759,29 +1691,284 @@ def start_smart_trial_v2(initial_sensor, water_type, characteristics):
     thread.start()
     return True
 
-def get_recommended_filter(sensor_data, water_type):
-    if rf_model2 is None:
-        return None
-    scores, _, all_combos = learning_system.get_model2_predictions(sensor_data, water_type)
-    best_idx = np.argmax(scores)
-    combo_tuple = all_combos[best_idx]
-    if all(v == 0 for v in combo_tuple):
-        return "OFF"
-    filters = [learning_system.base_filters[i] for i in range(len(learning_system.base_filters)) if combo_tuple[i]]
-    return ",".join(filters)
+def analyze_water_characteristics(sensor_data):
+    """Phân tích đặc điểm nước từ sensor data"""
+    characteristics = []
+    
+    ph = sensor_data.get('ph', 7.0)
+    tds = sensor_data.get('TDS', 0.0)
+    turbidity = sensor_data.get('turbidity', 0.0)
+    voc = sensor_data.get('VOC', 0.0)
+    
+    if ph < 6.0:
+        characteristics.append("Acidic")
+    elif ph > 8.5:
+        characteristics.append("Alkaline")
+    else:
+        characteristics.append("Neutral pH")
+    
+    if tds < 50:
+        characteristics.append("Soft Water")
+    elif tds < 150:
+        characteristics.append("Medium Hardness")
+    elif tds < 300:
+        characteristics.append("Hard Water")
+    else:
+        characteristics.append("Very Hard Water")
+    
+    if turbidity < 1.0:
+        characteristics.append("Clear")
+    elif turbidity < 5.0:
+        characteristics.append("Slightly Turbid")
+    elif turbidity < 10.0:
+        characteristics.append("Turbid")
+    else:
+        characteristics.append("Very Turbid")
+    
+    if voc < 0.1:
+        characteristics.append("Low VOC")
+    elif voc < 0.5:
+        characteristics.append("Medium VOC")
+    else:
+        characteristics.append("High VOC")
+    
+    return characteristics
 
-def get_model2_output(sensor_data, water_type):
-    if rf_model2 is None:
+# ================== DISTILLED REPRESENTATION FUNCTIONS ==================
+def calculate_distilled_representation():
+    """Tính toán distilled water representation"""
+    try:
+        if not os.path.exists(WATER_DATA_CSV):
+            logger.warning("water_data.csv not found for distilled representation")
+            return None
+        
+        df = pd.read_csv(WATER_DATA_CSV)
+        distilled_data = df[df['label'].str.contains('distilled|clean|pure|bestwater', case=False, na=False)]
+        
+        if len(distilled_data) < 10:
+            logger.warning(f"Not enough distilled water samples: {len(distilled_data)}")
+            return None
+        
+        representation = {
+            'pH_mean': float(distilled_data['pH'].mean()),
+            'pH_std': float(distilled_data['pH'].std()),
+            'TDS_ppm_mean': float(distilled_data['TDS_ppm'].mean()),
+            'TDS_ppm_std': float(distilled_data['TDS_ppm'].std()),
+            'turbidity_NTU_mean': float(distilled_data['turbidity_NTU'].mean()),
+            'turbidity_NTU_std': float(distilled_data['turbidity_NTU'].std()),
+            'VOC_mg_L_mean': float(distilled_data['VOC_mg_L'].mean()),
+            'VOC_mg_L_std': float(distilled_data['VOC_mg_L'].std()),
+            'count': len(distilled_data),
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        with open(DISTILLED_REP_CSV, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['parameter', 'mean_value', 'std_value', 'count', 'timestamp'])
+            for key, value in representation.items():
+                if key not in ['count', 'timestamp']:
+                    param_name = key.replace('_mean', '').replace('_std', '')
+                    if '_mean' in key:
+                        writer.writerow([param_name, value, representation.get(f'{param_name}_std', 0), 
+                                       representation['count'], representation['timestamp']])
+        
+        logger.info(f"Calculated distilled representation from {len(distilled_data)} samples")
+        return representation
+        
+    except Exception as e:
+        logger.error(f"Error calculating distilled representation: {e}")
         return None
-    scores, _, _ = learning_system.get_model2_predictions(sensor_data, water_type)
-    probs = _softmax(np.array(scores))
-    return np.array([probs])
+
+def load_distilled_representation():
+    """Tải distilled representation"""
+    global distilled_representation
+    
+    try:
+        if os.path.exists(DISTILLED_REP_CSV):
+            df = pd.read_csv(DISTILLED_REP_CSV)
+            representation = {}
+            for _, row in df.iterrows():
+                param = row['parameter']
+                representation[f'{param}_mean'] = row['mean_value']
+                representation[f'{param}_std'] = row['std_value']
+            
+            representation['count'] = int(df['count'].iloc[0])
+            representation['timestamp'] = df['timestamp'].iloc[0]
+            
+            distilled_representation = representation
+            logger.info("Loaded distilled water representation")
+            return representation
+        else:
+            return calculate_distilled_representation()
+    except Exception as e:
+        logger.error(f"Error loading distilled representation: {e}")
+        return None
+
+# ================== MAIN PROCESSING FUNCTION ==================
+def intelligent_process_sensor_data(sensor_data):
+    """
+    XỬ LÝ THÔNG MINH - TÍCH HỢP RANDOM FOREST MODEL 2
+    """
+    global current_water_type, current_water_confidence, current_water_characteristics
+    global current_ood_status, current_ood_reasons, current_recommended_method, current_method_source
+    global trial_in_progress, last_processing_result, rf_model2_handler
+    global last_processing_time
+
+    if not sensor_data:
+        return
+
+    last_processing_time = time.time()
+    
+    logger.info(f"Processing sensor: pH={sensor_data.get('ph','?'):.2f}, "
+                f"TDS={sensor_data.get('TDS','?'):.1f}, Turb={sensor_data.get('turbidity','?'):.2f}, "
+                f"VOC={sensor_data.get('VOC','?'):.3f}")
+
+    # 1. Phân tích đặc điểm nước
+    current_water_characteristics = analyze_water_characteristics(sensor_data)
+
+    # 2. Phân loại bằng Model 1
+    water_type, water_confidence, _ = classify_water_with_model1(sensor_data)
+    current_water_type = water_type
+    current_water_confidence = water_confidence
+
+    logger.info(f"Model 1 - Detected: '{water_type}' (conf: {water_confidence:.3f})")
+    logger.info(f"Characteristics: {current_water_characteristics}")
+
+    # ================== LOGIC QUYẾT ĐỊNH VỚI RANDOM FOREST ==================
+    
+    # Trường hợp 1: Nước sạch → bỏ qua hoàn toàn
+    if should_skip_trial(water_type):
+        logger.info(f"Detected CLEAN water ('{water_type}') → Turning OFF all filters")
+
+        current_ood_status = False
+        current_recommended_method = "OFF"
+        current_method_source = "CleanWater"
+        current_ood_reasons = [f"Label '{water_type}' → no filtering needed"]
+
+        apply_filter_method("OFF")
+
+        if trial_in_progress:
+            with trial_cancel_lock:
+                trial_cancel_requested = True
+            logger.info("Trial cancelled due to clean water detection!")
+
+        return
+    
+    # Trường hợp 2: Sử dụng Random Forest Model 2
+    if rf_model2_handler.is_trained:
+        # Predict với Random Forest
+        filter_method, confidence, uncertainty, is_ood = rf_model2_handler.predict(sensor_data)
+        
+        logger.info(f"Random Forest Prediction: method={filter_method}, "
+                   f"conf={confidence:.3f}, uncertainty={uncertainty:.3f}, is_ood={is_ood}")
+        
+        if filter_method is None:
+            # Model 2 lỗi
+            logger.warning("Random Forest Model 2 prediction error")
+            current_ood_status = True
+            current_ood_reasons = ["RF Model error"]
+            current_recommended_method = "Trial needed"
+            current_method_source = "RF_Error"
+            
+            if not trial_in_progress:
+                logger.info("Starting trial due to RF model error...")
+                start_smart_trial_v2(sensor_data, water_type, current_water_characteristics)
+        
+        elif is_ood:
+            # Model 2 phát hiện OOD
+            logger.info(f"Random Forest - OOD detected!")
+            
+            current_ood_status = True
+            current_ood_reasons = [
+                f"High uncertainty ({uncertainty:.3f})",
+                f"Low confidence ({confidence:.3f})",
+                f"Water type: {water_type}"
+            ]
+            current_recommended_method = "Trial needed"
+            current_method_source = "RF_OOD_Detection"
+            
+            if not trial_in_progress:
+                logger.info("Starting smart trial for OOD sample...")
+                start_smart_trial_v2(sensor_data, water_type, current_water_characteristics)
+        
+        else:
+            # Model 2 tự tin dự đoán
+            logger.info(f"Random Forest - Confident prediction: {filter_method}")
+            
+            current_ood_status = False
+            current_ood_reasons = ["Confident RF prediction"]
+            current_recommended_method = filter_method
+            current_method_source = "RandomForest"
+            
+            # Áp dụng filter method
+            apply_filter_method_from_name(filter_method)
+            
+            # CHỈ GHI TRAINING DATA KHI KHÔNG PHẢI "OFF" hoặc "Trial needed"
+            if filter_method and filter_method != "OFF" and filter_method != "Trial needed":
+                logger.info(f"Saving to training data: {water_type} -> {filter_method}")
+                append_filter_training(sensor_data, water_type, filter_method)
+            else:
+                logger.info(f"⏭Skipping training data for method: {filter_method}")
+    
+    else:
+        # Model 2 chưa được train
+        logger.warning("Random Forest Model 2 not trained yet")
+        
+        # Kiểm tra xem có solution đã biết không
+        has_solution, known_method = has_good_known_solution(sensor_data, water_type)
+        
+        if has_solution:
+            logger.info(f"Using known solution: {known_method}")
+            current_ood_status = False
+            current_ood_reasons = ["Known solution from history"]
+            current_recommended_method = known_method
+            current_method_source = "History"
+            
+            apply_filter_method_from_name(known_method)
+            
+            # CHỈ GHI TRAINING DATA KHI KHÔNG PHẢI "OFF"
+            if known_method and known_method != "OFF" and known_method != "Trial needed":
+                append_filter_training(sensor_data, water_type, known_method)
+            
+            # Kiểm tra xem có đủ data để train model chưa
+            check_and_retrain_rf_model()
+            
+        else:
+            # Không có solution đã biết, cần trial
+            logger.info("No known solution, starting trial...")
+            current_ood_status = True
+            current_ood_reasons = ["No RF model & no known solution"]
+            current_recommended_method = "Trial in progress"
+            current_method_source = "Starting_Trial"
+            
+            if not trial_in_progress:
+                start_smart_trial_v2(sensor_data, water_type, current_water_characteristics)
+
+    # Cập nhật kết quả xử lý
+    with state_lock:
+        last_processing_result = {
+            'timestamp': datetime.now().isoformat(),
+            'sensor': sensor_data.copy(),
+            'water_type': water_type,
+            'confidence': water_confidence,
+            'characteristics': current_water_characteristics,
+            'is_ood': current_ood_status,
+            'ood_reasons': current_ood_reasons,
+            'recommended': current_recommended_method,
+            'source': current_method_source,
+            'trial_in_progress': trial_in_progress
+        }
+
+    logger.info(f"Decision: OOD={current_ood_status} | Method: {current_recommended_method} | Source: {current_method_source}")
 
 def intelligent_control_loop():
+    """Control loop thông minh tích hợp Random Forest"""
     global last_sensor_request_time, current_sensor_data, stream_active
     global current_water_type, current_water_confidence, trial_in_progress
     
     sensor_fail_count = 0
+    
+    logger.info("Intelligent Control Loop started")
     
     while system_running:
         try:
@@ -801,44 +1988,22 @@ def intelligent_control_loop():
                     with state_lock:
                         current_sensor_data = raw_sensor_data
                     
-                    characteristics = learning_system.analyze_water_characteristics(raw_sensor_data)
+                    logger.info(f"New sensor data received, processing...")
                     
-                    water_type, water_confidence, _ = classify_water_with_model1(raw_sensor_data)
+                    # Xử lý sensor data
+                    intelligent_process_sensor_data(raw_sensor_data)
                     
-                    global current_water_type, current_water_confidence, current_water_characteristics
-                    current_water_type = water_type
-                    current_water_confidence = water_confidence
-                    current_water_characteristics = characteristics
+                    logger.info(f"After processing: Type={current_water_type}, "
+                              f"OOD={current_ood_status}, Method={current_recommended_method}, "
+                              f"Source={current_method_source}")
                     
-                    logger.info(f"Detected: {water_type} (Confidence: {water_confidence:.2f})")
-                    
-                    if not trial_in_progress:
-                        model_output = get_model2_output(raw_sensor_data, water_type)
-                        if model_output is not None:
-                            ood_detector = Model2BasedOODDetector()
-                            is_ood, _ = ood_detector.detect_ood(model_output, raw_sensor_data)
-                            global current_ood_status
-                            current_ood_status = is_ood
-                        else:
-                            is_ood = True
-                        
-                        if not is_ood:
-                            best_method = get_recommended_filter(raw_sensor_data, water_type)
-                            if best_method:
-                                logger.info(f"Applying recommended method: {best_method}")
-                                apply_filter_combination(best_method.split(',') if best_method != "OFF" else ["OFF"])
-                                current_recommended_method = best_method
-                                current_method_source = "Model2 Recommendation"
-                        else:
-                            logger.info(f"OOD detected: {water_type} -> Starting smart trial")
-                            start_smart_trial_v2(raw_sensor_data, water_type, characteristics)
-                            
+                    # Lưu vào CSV
                     append_sensor_data(raw_sensor_data)
                     
                 else:
                     sensor_fail_count += 1
                     if sensor_fail_count >= 3:
-                        logger.warning("Sensor data unavailable")
+                        logger.warning("⚠️ Sensor data unavailable")
                         sensor_fail_count = 0
                 
                 last_sensor_request_time = current_time
@@ -850,93 +2015,17 @@ def intelligent_control_loop():
             time.sleep(0.5)
             
         except Exception as e:
-            logger.error(f"Intelligent control loop error: {e}")
+            logger.error(f"Control loop error: {e}")
             time.sleep(2)
 
-def signal_handler(sig, frame):
-    global system_running
-    logger.info("Shutdown signal received")
-    system_running = False
-
-def train_model2():
-    try:
-        df = pd.read_csv(FILTER_TRAINING_CSV)
-        if 'timestamp' not in df.columns:
-            df.columns = ['timestamp', 'ph', 'TDS', 'turbidity', 'VOC', 'water_type', 'filter_combo', 'performance']
-        
-        df = df.dropna()
-        df[['ph', 'TDS', 'turbidity', 'VOC', 'performance']] = df[['ph', 'TDS', 'turbidity', 'VOC', 'performance']].astype(float)
-        
-        global water_encoder
-        water_encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
-        water_encoder.fit(df[['water_type']])
-        onehot_water = water_encoder.transform(df[['water_type']])
-        onehot_df = pd.DataFrame(onehot_water, columns=water_encoder.get_feature_names_out(['water_type']))
-        
-        base_filters = learning_system.base_filters
-        for f in base_filters:
-            df[f] = df['filter_combo'].apply(lambda x: 1 if f in str(x).split(',') else 0)
-        
-        X = pd.concat([df[['ph', 'TDS', 'turbidity', 'VOC']], onehot_df, df[base_filters]], axis=1)
-        y = df['performance']
-        
-        rf = RandomForestRegressor(n_estimators=100, random_state=42, oob_score=True)
-        rf.fit(X, y)
-        
-        joblib.dump(rf, MODEL_2_RF_PATH)
-        joblib.dump(water_encoder, WATER_ENCODER_PATH)
-        
-        logger.info("Model 2 (RandomForest) retrained successfully!")
-        return rf
-    except Exception as e:
-        logger.error(f"Error training Model 2: {e}")
-        return None
-
-def validate_and_clean_training_data():
-    logger.info("Starting training data validation...")
-    
-    try:
-        df = pd.read_csv(FILTER_TRAINING_CSV)
-        df = df.dropna()
-        df.to_csv(FILTER_TRAINING_CSV + ".cleaned", index=False)
-        cleaned_df = df
-    except Exception as e:
-        logger.error(f"Error reading/cleaning CSV: {e}")
-        return False
-    
-    if cleaned_df is not None and not cleaned_df.empty:
-        n_classes = len(cleaned_df['water_type'].unique()) if 'water_type' in cleaned_df.columns else 0
-        n_methods = len(cleaned_df['filter_combo'].unique()) if 'filter_combo' in cleaned_df.columns else 0
-        
-        stats = {
-            'total_samples': len(cleaned_df),
-            'n_classes': n_classes,
-            'n_methods': n_methods
-        }
-        is_ready = stats['total_samples'] >= 100 and stats['n_classes'] >= 3
-        
-        if is_ready:
-            logger.info("Data is READY for Model 2 training!")
-            logger.info(f"{stats['total_samples']} samples, {stats['n_classes']} classes, {stats['n_methods']} methods")
-            
-            import shutil
-            shutil.copy(FILTER_TRAINING_CSV + ".cleaned", FILTER_TRAINING_CSV)
-            logger.info(f"Cleaned data applied to {FILTER_TRAINING_CSV}")
-            
-            return True
-        else:
-            logger.warning(f"Data NOT ready: Not enough samples or classes")
-            logger.info(f"Current stats: {stats}")
-            return False
-    else:
-        logger.warning("No data or empty DataFrame after cleaning")
-        return False
-
+# ================== DISPLAY FUNCTIONS ==================
 def create_display_frame():
+    """Tạo frame hiển thị với đầy đủ thông tin"""
     display_frame = np.zeros((DISPLAY_HEIGHT, DISPLAY_WIDTH, 3), dtype=np.uint8)
     
     current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
+    # ============ PHẦN HIỂN THỊ BÊN TRÁI (VIDEO) ============
     left_x = 20
     left_y = 20
     
@@ -1025,11 +2114,33 @@ def create_display_frame():
     method_y = ood_y + 30
     cv2.putText(display_frame, f"Recommended Filter: {current_recommended_method}", 
                 (right_x, method_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, 
-                (0, 255, 0) if current_recommended_method != "OFF" else (255, 255, 0), 2)
+                (0, 255, 0) if current_recommended_method != "OFF" and "Trial" not in current_recommended_method else (255, 255, 0), 2)
     
     cv2.putText(display_frame, f"Source: {current_method_source}", 
                 (right_x, method_y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
     
+    # ============ PHẦN RANDOM FOREST MODEL 2 INFO ============
+    rf_x = 550
+    rf_y = 250
+    
+    rf_info = rf_model2_handler.get_info()
+    cv2.putText(display_frame, "RANDOM FOREST MODEL 2", (rf_x, rf_y), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    
+    status_color = (0, 255, 0) if rf_info['is_trained'] else (0, 0, 255)
+    status_text = "TRAINED" if rf_info['is_trained'] else "NOT TRAINED"
+    cv2.putText(display_frame, f"Status: {status_text}", 
+                (rf_x, rf_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1)
+    
+    if rf_info['is_trained']:
+        cv2.putText(display_frame, f"Classes: {rf_info['n_classes']}", 
+                    (rf_x, rf_y + 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        cv2.putText(display_frame, f"Samples: {rf_info['training_samples']}", 
+                    (rf_x, rf_y + 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        cv2.putText(display_frame, f"Trees: {rf_info['n_trees']}", 
+                    (rf_x, rf_y + 105), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    
+    # ============ PHẦN TRIAL INFO ============
     trial_x = 20
     trial_y = 400
     
@@ -1038,6 +2149,7 @@ def create_display_frame():
             "Running": (0, 255, 255),
             "Completed": (0, 255, 0),
             "Failed": (0, 0, 255),
+            "Cancelled": (255, 165, 0),
             "Idle": (128, 128, 128)
         }.get(current_trial_info["status"], (255, 255, 255))
         
@@ -1084,6 +2196,7 @@ def create_display_frame():
                 (relay_x, relay_y_pos + 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, 
                 (0, 255, 0) if current_relay_state != "OFF" else (255, 255, 255), 2)
     
+    # ============ PHẦN SYSTEM INFO ============
     info_x = 20
     info_y = 550
     
@@ -1094,7 +2207,7 @@ def create_display_frame():
         f"ESP32-CAM IP: {ESP32_CAM_IP}",
         f"Last Process: {datetime.fromtimestamp(last_processing_time).strftime('%H:%M:%S') if last_processing_time > 0 else 'Never'}",
         "Controls: S - Toggle Stream | Q - Quit",
-        "Mode: AUTOMATIC TRIAL & LEARNING SYSTEM"
+        "Mode: AUTOMATIC TRIAL & RANDOM FOREST LEARNING"
     ]
     
     for i, line in enumerate(info_lines):
@@ -1102,10 +2215,10 @@ def create_display_frame():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
     
     status_bar_y = 780
-    status_color = (0, 255, 0) if system_running and test_wifi_connection() else (0, 0, 255)
-    status_text = "SYSTEM READY" if system_running and test_wifi_connection() else "SYSTEM ERROR"
-    
     cv2.rectangle(display_frame, (0, status_bar_y), (DISPLAY_WIDTH, DISPLAY_HEIGHT), (40, 40, 40), -1)
+    
+    status_color = (0, 255, 0) if system_running else (0, 0, 255)
+    status_text = "SYSTEM READY" if system_running else "SYSTEM STOPPED"
     
     cv2.putText(display_frame, f"Status: {status_text}", (20, status_bar_y + 20), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
@@ -1143,6 +2256,10 @@ def display_loop():
                 if current_sensor_data and not trial_in_progress:
                     logger.info("Manual trial triggered")
                     start_smart_trial_v2(current_sensor_data, current_water_type, current_water_characteristics)
+            elif key == ord('r') or key == ord('R'):
+                # Manual retrain RF model
+                logger.info("Manual retrain requested")
+                check_and_retrain_rf_model()
             
         except Exception as e:
             logger.error(f"Display error: {e}")
@@ -1174,74 +2291,15 @@ def start_background_threads():
     logger.info(f"Started {len(threads)} background threads")
     return threads
 
-def initialize_models():
-    global yolo_model, interp1, input1_details, output1_details, mean1, scale1, names1
-    global rf_model2, water_encoder
-    
-    yolo_model = YOLO(YOLO_MODEL_PATH)
-    
-    if TF_AVAILABLE:
-        interp1 = tf.lite.Interpreter(model_path=MLP_MODEL_1_TFLITE_PATH)
-        interp1.allocate_tensors()
-        input1_details = interp1.get_input_details()[0]
-        output1_details = interp1.get_output_details()[0]
-        
-        try:
-            with open(MODEL_1_PARAMS_PATH, 'r') as f:
-                params1 = json.load(f)
-            
-            scaler_model = params1.get('scaler_parameters', {}).get('model', {})
-            mean1 = np.array(scaler_model.get('mean', [0.0] * 4), dtype=np.float32)
-            scale1 = np.array(scaler_model.get('scale', [1.0] * 4), dtype=np.float32)
-            
-            class_names_dict = params1.get('class_names', {})
-            names1 = class_names_dict.get('classes', ['Unknown'] * 4) 
-            
-            logger.info(f"Model 1 loaded successfully: mean={mean1}, scale={scale1}, classes={names1}")
-        except Exception as e:
-            logger.warning(f"Failed to load Model 1 params: {e}. Using default values.")
-            mean1 = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
-            scale1 = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
-            names1 = ['bestwater', 'hardwater', 'nothing', 'rainwater'] 
-    
-    if AUTO_RETRAIN_MODEL2 and validate_and_clean_training_data():
-        rf_model2 = train_model2()
-    elif os.path.exists(MODEL_2_RF_PATH) and os.path.exists(WATER_ENCODER_PATH):
-        rf_model2 = joblib.load(MODEL_2_RF_PATH)
-        water_encoder = joblib.load(WATER_ENCODER_PATH)
-        logger.info("Loaded Model 2 (RandomForest)")
-    else:
-        logger.warning("Model 2 not loaded - will use fallback rules for suggestions")
-
-def classify_water_with_model1(sensor_data):
-    try:
-        features = np.array([sensor_data.get('ph', 0), sensor_data.get('TDS', 0), 
-                             sensor_data.get('turbidity', 0), sensor_data.get('VOC', 0)], dtype=np.float32)
-        normalized = (features - mean1) / scale1
-        
-        with _interpreter_lock1:
-            interp1.set_tensor(input1_details['index'], normalized.reshape(1, -1))
-            interp1.invoke()
-            output = interp1.get_tensor(output1_details['index'])[0]
-        
-        probs = _softmax(output)
-        label_idx = np.argmax(probs)
-        confidence = probs[label_idx]
-        label = names1[label_idx]
-        
-        return label, float(confidence), probs.tolist()
-    except Exception as e:
-        logger.error(f"Error classifying water: {e}")
-        return "Unknown", 0.0, []
-
 def initialize_system():
+    """Khởi tạo hệ thống"""
     logger.info("Initializing WIFI Water Filter System...")
     
     ensure_data_files()
     
     if os.path.exists(FILTER_TRAINING_CSV):
         logger.info("Checking training data quality...")
-        validate_and_clean_training_data()
+        data_validator.validate_training_data(FILTER_TRAINING_CSV)
     
     global water_signatures_cache, distilled_representation
     water_signatures_cache = load_water_signatures()
@@ -1249,10 +2307,7 @@ def initialize_system():
     
     initialize_models()
     
-    model2_ood_detector = Model2BasedOODDetector()
-    model2_ood_detector.load_stats()
-    logger.info(f"Model2-OOD: {model2_ood_detector.stats['total_predictions']} predictions, "
-                f"{model2_ood_detector.get_ood_rate()*100:.1f}% OOD rate")
+    initialize_rf_model()
     
     logger.info("Testing WiFi connection to ESP32-CAM...")
     try:
@@ -1270,108 +2325,30 @@ def initialize_system():
     start_background_threads()
     
     logger.info("WiFi Water Filter System initialized successfully!")
-    logger.info(f"Colab Data Preparation: {'ENABLED' if AUTO_RETRAIN_MODEL2 else 'DISABLED'}")
+    logger.info(f"Random Forest Auto-retrain: {'ENABLED' if AUTO_RETRAIN_MODEL2 else 'DISABLED'}")
+    
+    model_info = rf_model2_handler.get_info()
+    if model_info['is_trained']:
+        logger.info(f"Random Forest Model 2: {model_info['n_classes']} classes, {model_info['training_samples']} samples")
+    else:
+        logger.info("Random Forest Model 2: Not trained yet - will train when enough data")
 
 def cleanup_system():
+    """Dọn dẹp hệ thống khi kết thúc"""
     global system_running
     system_running = False
     
     logger.info("Turning off all relays...")
     send_command_to_arduino("abcdefg")
     
-    model2_ood_detector = Model2BasedOODDetector()
-    model2_ood_detector.save_stats()
-    
     logger.info("System cleanup completed")
-
-def load_water_signatures():
-    try:
-        with open(WATER_SIGNATURES_JSON, 'r') as f:
-            return json.load(f)
-    except:
-        return {}
-
-def load_distilled_representation():
-    try:
-        return pd.read_csv(DISTILLED_REP_CSV)
-    except:
-        return None
-
-def append_sensor_data(sensor_data):
-    with csv_lock, open(SENSOR_DATA_CSV, 'a', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow([datetime.now().isoformat()] + list(sensor_data.values()))
-
-def optimized_yolo_processing():
-    while system_running:
-        with frame_lock:
-            if latest_frame is not None:
-                results = yolo_model(latest_frame)
-                annotated_frame = results[0].plot()
-                global latest_frame_with_boxes, yolo_detections
-                latest_frame_with_boxes = annotated_frame
-                yolo_detections = [result.names[int(cls)] for result in results for cls in result.boxes.cls]
-        time.sleep(1)  # Process every second
-
-def optimized_video_stream():
-    session = requests.Session()
-    retry = Retry(connect=3, backoff_factor=0.5)
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
-    
-    while system_running:
-        if stream_active:
-            try:
-                response = session.get(STREAM_URL, stream=True)
-                if response.status_code == 200:
-                    bytes_data = bytes()
-                    for chunk in response.iter_content(chunk_size=1024):
-                        bytes_data += chunk
-                        a = bytes_data.find(b'\xff\xd8')
-                        b = bytes_data.find(b'\xff\xd9')
-                        if a != -1 and b != -1:
-                            jpg = bytes_data[a:b+2]
-                            bytes_data = bytes_data[b+2:]
-                            frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
-                            with frame_lock:
-                                global latest_frame
-                                latest_frame = frame
-            except Exception as e:
-                logger.error(f"Video stream error: {e}")
-                time.sleep(1)
-
-def test_wifi_connection():
-    try:
-        requests.get(STATUS_URL, timeout=2)
-        return True
-    except:
-        return False
-
-def ensure_data_files():
-    for file in [WATER_DATA_CSV, SENSOR_DATA_CSV, TRIAL_RESULTS_CSV, FILTER_TRAINING_CSV, WATER_SIGNATURES_JSON, DISTILLED_REP_CSV]:
-        if not os.path.exists(file):
-            open(file, 'w').close()
-
-def update_water_signature(sensor_data, best_method, score, achieved_threshold):
-    try:
-        signatures = load_water_signatures()
-        key = tuple(sensor_data.values())
-        signatures[str(key)] = {
-            'best_method': best_method,
-            'score': score,
-            'achieved_threshold': achieved_threshold
-        }
-        with open(WATER_SIGNATURES_JSON, 'w') as f:
-            json.dump(signatures, f, indent=4)
-    except Exception as e:
-        logger.error(f"Error updating water signature: {e}")
 
 if __name__ == '__main__':
     try:
         initialize_system()
         time.sleep(2)
         display_loop()
+        
     except KeyboardInterrupt:
         logger.info("System interrupted by user")
     except Exception as e:
