@@ -1,7 +1,8 @@
 #include "esp_camera.h"
 #include "WiFi.h"
-#include "ESPAsyncWebServer.h"
-#include "AsyncTCP.h"
+#include "WiFiClient.h"
+#include "WebServer.h"
+#include "ESPmDNS.h"
 #include "Arduino_JSON.h"
 #include <Arduino.h>
 
@@ -35,7 +36,7 @@ const char* ap_password = "12345678";
 #define SERIAL_TIMEOUT 100
 #define STREAM_INTERVAL_MS 200  // Giảm FPS xuống 5 FPS để giảm tải
 
-AsyncWebServer server(80);
+WebServer server(80);
 bool apStarted = false;
 
 // Biến toàn cục
@@ -51,41 +52,13 @@ camera_fb_t *fb = NULL;
 
 void setupCamera();
 void startAccessPoint();
-void handleRoot(AsyncWebServerRequest *request);
-void handleStream(AsyncWebServerRequest *request);
-void handleStatus(AsyncWebServerRequest *request);
-void handleSensorData(AsyncWebServerRequest *request);
-void handleGetSensor(AsyncWebServerRequest *request);
-void handleSetCommand(AsyncWebServerRequest *request);
-void handleGetCommand(AsyncWebServerRequest *request);
-
-void streamTask(void *param){
-  AsyncWebServerRequest *request = (AsyncWebServerRequest*)param;
-  AsyncResponseStream *response = request->beginResponseStream("multipart/x-mixed-replace; boundary=frame");
-  response->addHeader("Access-Control-Allow-Origin", "*");
-  response->addHeader("Cache-Control", "no-cache");
-  request->send(response);
-  
-  unsigned long lastFrameTime = 0;
-  while(request->client()->connected()){
-    unsigned long currentTime = millis();
-    if (currentTime - lastFrameTime >= STREAM_INTERVAL_MS) {
-      fb = esp_camera_fb_get();
-      if (fb){
-        response->print("--frame\r\n");
-        response->print("Content-Type: image/jpeg\r\n");
-        response->print("Content-Length: " + String(fb->len) + "\r\n\r\n");
-        response->write(fb->buf, fb->len);
-        response->print("\r\n");
-        esp_camera_fb_return(fb);
-        fb = NULL;
-      }
-      lastFrameTime = currentTime;
-    }
-    vTaskDelay(10 / portTICK_PERIOD_MS);
-  }
-  vTaskDelete(NULL);
-}
+void handleRoot();
+void handleStream();
+void handleStatus();
+void handleSensorData();
+void handleGetSensor();
+void handleSetCommand();
+void handleGetCommand();
 
 void setup() {
   Serial.begin(SERIAL_BAUDRATE);
@@ -99,8 +72,8 @@ void setup() {
   startAccessPoint();
   
   if (apStarted) {
-    server.on("/", HTTP_GET, handleRoot);
-    server.on("/stream", HTTP_GET, handleStream);
+    server.on("/", handleRoot);
+    server.on("/stream", handleStream);
     server.on("/status", HTTP_GET, handleStatus);
     server.on("/sensor_data", HTTP_POST, handleSensorData);
     server.on("/get_sensor", HTTP_GET, handleGetSensor);
@@ -121,6 +94,11 @@ void setup() {
 }
 
 void loop() {
+  if (apStarted) {
+    server.handleClient();
+  }
+  
+  // Xử lý command từ serial nếu có
   if (Serial.available() > 0) {
     String command = Serial.readStringUntil('\n');
     command.trim();
@@ -136,7 +114,7 @@ void loop() {
     }
   }
   
-  delay(10);
+  delay(10);  // Giảm delay để xử lý request nhanh hơn
 }
 
 void setupCamera() {
@@ -159,12 +137,12 @@ void setupCamera() {
   config.pin_sscb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;  // Up to 20MHz for better FPS
+  config.xclk_freq_hz = 10000000;
   config.pixel_format = PIXFORMAT_JPEG;
   
   config.frame_size = FRAME_SIZE;
   config.jpeg_quality = JPEG_QUALITY;
-  config.fb_count = 2;  // Double buffer for smoother stream
+  config.fb_count = 1;
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
@@ -213,77 +191,152 @@ void startAccessPoint() {
   Serial.println("Access Point started successfully!");
 }
 
-void handleRoot(AsyncWebServerRequest *request){
-  const char* html = "<html><head><title>ESP32-CAM Water Filter</title>"
-                     "<meta http-equiv='refresh' content='5'>"
-                     "</head><body>"
-                     "<h1>ESP32-CAM Water Filter System</h1>"
-                     "<img src='/stream' style='width: 640px;'/>"
-                     "<p><a href='/status'>System Status</a></p>"
-                     "<p>Auto-refresh every 5 seconds</p>"
-                     "</body></html>";
-  request->send(200, "text/html", html);
-}
-
-void handleStream(AsyncWebServerRequest *request){
-  if (WiFi.softAPgetStationNum() > 2) {
-    request->send(503, "text/plain", "Too many clients connected");
-    return;
-  }
-  xTaskCreatePinnedToCore(streamTask, "stream", 8192, request, 1, NULL, 1);
-}
-
-void handleStatus(AsyncWebServerRequest *request){
-  JSONVar status;
-  status["status"] = "online";
-  status["mode"] = "access_point";
-  status["ap_ssid"] = ap_ssid;
-  status["ap_ip"] = WiFi.softAPIP().toString();
-  status["clients_connected"] = WiFi.softAPgetStationNum();
-  status["free_heap"] = esp_get_free_heap_size();
-  status["sensor_data_available"] = sensorDataAvailable ? true : false;
-  status["last_sensor_update"] = lastSensorUpdate;
-  
-  request->send(200, "application/json", JSON.stringify(status));
-}
-
-void handleSensorData(AsyncWebServerRequest *request){
-  if (request->hasArg("plain")) {
-    currentSensorData = request->arg("plain");
+void handleSensorData() {
+  if (server.method() == HTTP_POST) {
+    String newData = server.arg("plain");
+    
+    Serial.print("Received sensor data: ");
+    Serial.println(newData);
+    
+    currentSensorData = newData;
     lastSensorUpdate = millis();
     sensorDataAvailable = true;
-    Serial.print("Received sensor data: ");
-    Serial.println(currentSensorData);
-    request->send(200, "application/json", "{\"status\":\"received\"}");
+    
+    server.send(200, "application/json", "{\"status\":\"received\"}");
   } else {
-    request->send(400, "text/plain", "No data");
+    server.send(405, "text/plain", "Method Not Allowed");
   }
 }
 
-void handleGetSensor(AsyncWebServerRequest *request){
+void handleGetSensor() {
   if (sensorDataAvailable && currentSensorData.length() > 0 && currentSensorData != "{}") {
-    request->send(200, "application/json", currentSensorData);
+    server.send(200, "application/json", currentSensorData);
   } else {
-    request->send(200, "application/json", "{\"error\":\"No sensor data available\"}");
+    server.send(200, "application/json", "{\"error\":\"No sensor data available\"}");
   }
 }
 
-void handleSetCommand(AsyncWebServerRequest *request){
-  if (request->hasArg("plain")) {
-    currentCommand = request->arg("plain");
+void handleSetCommand() {
+  if (server.method() == HTTP_POST) {
+    String newCommand = server.arg("plain");
+    
     Serial.print("Received command: ");
-    Serial.println(currentCommand);
-    request->send(200, "application/json", "{\"status\":\"command_received\"}");
+    Serial.println(newCommand);
+    
+    currentCommand = newCommand;
+    
+    server.send(200, "application/json", "{\"status\":\"command_received\"}");
   } else {
-    request->send(400, "text/plain", "No command");
+    server.send(405, "text/plain", "Method Not Allowed");
   }
 }
 
-void handleGetCommand(AsyncWebServerRequest *request){
+void handleGetCommand() {
   if (currentCommand.length() > 0) {
-    request->send(200, "text/plain", currentCommand);
-    currentCommand = "";  // Clear after sending
+    server.send(200, "text/plain", currentCommand);
+    currentCommand = "";  // Clear command after sending
   } else {
-    request->send(200, "text/plain", "No command");
+    server.send(200, "text/plain", "No command");
   }
+}
+
+void handleRoot() {
+  String html = "<html><head><title>ESP32-CAM Water Filter</title>";
+  html += "<meta http-equiv='refresh' content='5'>";
+  html += "</head><body>";
+  html += "<h1>ESP32-CAM Water Filter System</h1>";
+  html += "<img src='/stream' style='width: 640px;'/>";
+  html += "<p><a href='/status'>System Status</a></p>";
+  html += "<p>Auto-refresh every 5 seconds</p>";
+  html += "</body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleStream() {
+  WiFiClient client = server.client();
+  
+  if (!client.connected()) {
+    return;
+  }
+  
+  // Kiểm tra số lượng client - giới hạn để tránh quá tải
+  int clientCount = WiFi.softAPgetStationNum();
+  if (clientCount > 2) {
+    Serial.println("Too many clients, rejecting stream");
+    client.println("HTTP/1.1 503 Service Unavailable");
+    client.println("Content-Type: text/plain");
+    client.println();
+    client.println("Too many clients connected");
+    client.stop();
+    return;
+  }
+  
+  // Gửi HTTP response header
+  String response = "HTTP/1.1 200 OK\r\n";
+  response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n";
+  response += "Access-Control-Allow-Origin: *\r\n";
+  response += "Cache-Control: no-cache\r\n";
+  response += "Connection: keep-alive\r\n";
+  response += "\r\n";
+  client.print(response);
+  
+  unsigned long lastFrameTime = 0;
+  unsigned long streamStartTime = millis();
+  
+  // Stream liên tục, không giới hạn thời gian
+  while (client.connected()) {
+    // Xử lý các request khác trong khi stream
+    server.handleClient();
+    
+    unsigned long currentTime = millis();
+    
+    // Chỉ gửi frame mỗi STREAM_INTERVAL_MS
+    if (currentTime - lastFrameTime >= STREAM_INTERVAL_MS) {
+      fb = esp_camera_fb_get();
+      if (!fb) {
+        Serial.println("Camera capture failed");
+        if (fb) {
+          esp_camera_fb_return(fb);
+        }
+        delay(50);
+        continue;
+      }
+
+      // Gửi frame boundary và header
+      client.print("--frame\r\n");
+      client.print("Content-Type: image/jpeg\r\n");
+      client.print("Content-Length: " + String(fb->len) + "\r\n");
+      client.print("\r\n");
+      
+      // Gửi frame data
+      client.write(fb->buf, fb->len);
+      client.print("\r\n");
+      
+      esp_camera_fb_return(fb);
+      fb = NULL;
+      
+      lastFrameTime = currentTime;
+    }
+    
+    delay(10);  // Nhường CPU cho các task khác
+  }
+  
+  client.stop();
+  Serial.println("Stream ended");
+}
+
+void handleStatus() {
+  String json = "{";
+  json += "\"status\":\"online\",";
+  json += "\"mode\":\"access_point\",";
+  json += "\"ap_ssid\":\"" + String(ap_ssid) + "\",";
+  json += "\"ap_ip\":\"" + WiFi.softAPIP().toString() + "\",";
+  json += "\"clients_connected\":" + String(WiFi.softAPgetStationNum()) + ",";
+  json += "\"free_heap\":" + String(esp_get_free_heap_size()) + ",";
+  json += "\"sensor_data_available\":" + String(sensorDataAvailable ? "true" : "false") + ",";
+  json += "\"last_sensor_update\":" + String(lastSensorUpdate);
+  json += "}";
+  
+  server.send(200, "application/json", json);
 }
